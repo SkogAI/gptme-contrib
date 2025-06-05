@@ -2,24 +2,38 @@
 
 This directory contains patches and enhancements for SkogAI agents that can be applied to existing installations.
 
-## Patching System (v0.1)
+## System Architecture
 
-The patching system allows for extending the functionality of gptme-based agents. When a patch is applied:
+The SkogAI patching system extends gptme-based agents with additional functionality while maintaining compatibility with the upstream project. The system works as follows:
 
-1. It modifies the fork.sh script in the current project
-2. It ensures the patch is also applied to any new agent workspaces created with fork.sh
-3. Patches are designed to be modular and non-destructive
+1. **Bootstrap Process**: The bootstrap patch modifies fork.sh to propagate patches to new agent workspaces
+2. **Patch Organization**: Patches are stored in gptme-contrib/patches/skogai/{patch-name}/
+3. **Auto-Apply**: Patches with auto-apply.sh scripts are automatically applied to new workspaces
+4. **Self-Propagation**: All patches are copied to new agent workspaces during forking
 
-### How It Works
+### Directory Structure
 
-The patching system works by injecting code into the fork.sh script that will:
-- Apply patches to the current workspace
-- Copy the patches to the new agent workspace
-- Set up the new workspace to use the patches
+```
+gptme-contrib/
+└── patches/
+    ├── README.md (this file)
+    └── skogai/
+        └── {patch-name}/
+            ├── {patch-name}.sh (main patch script)
+            └── auto-apply.sh (optional, runs automatically in new workspaces)
+```
 
-This creates a self-propagating enhancement system that maintains compatibility with the upstream gptme project while adding SkogAI-specific features.
+### Patch Lifecycle
+
+1. **Development**: Patches are initially developed in skogai-contrib for testing
+2. **Bootstrap**: The bootstrap patch copies patches to gptme-contrib
+3. **Propagation**: When fork.sh runs, patches are copied to the new workspace
+4. **Auto-Apply**: Any auto-apply.sh scripts run in the new workspace
 
 ## Available Patches
+
+### Patching Bootstrap (v0.1)
+The foundation patch that enables the patching system.
 
 ### Context System Patch (v0.1)
 Enhanced context management for agent workspaces.
@@ -32,5 +46,9 @@ To apply a patch:
 ./gptme-contrib/patches/skogai/0.1-patching-bootstrap/0.1-patching-bootstrap.sh
 ```
 
-This will bootstrap the patching system and allow for additional patches to be applied.
+To run tests:
+
+```bash
+./skogai-contrib/run-tests.sh
+```
 
