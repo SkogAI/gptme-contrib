@@ -56,6 +56,7 @@ tweets/
 
 1. Configure Twitter credentials in `.env`:
 ```env
+
 # OAuth 2.0 (Recommended)
 TWITTER_CLIENT_ID=your_client_id
 TWITTER_CLIENT_SECRET=your_client_secret
@@ -75,6 +76,7 @@ TWITTER_ACCESS_SECRET=your_access_secret
 ### Command Line Usage
 
 ```bash
+
 # Post a tweet
 ./twitter.py post "Hello world!"
 
@@ -122,6 +124,7 @@ Instead of built-in cron setup, you can use various methods to automate the Twit
 Add entries to your crontab:
 
 ```bash
+
 # Monitor timeline every 15 minutes
 */15 * * * * cd /path/to/project && ./workflow.py monitor --dry-run
 
