@@ -14,9 +14,11 @@ This repo is meant as a place for the community to share tools and scripts that 
 If you have a tool you'd like to share, please consider contributing it here!
 
 <!--
+
 ## Installation
 
 ```bash
+
 # Install base package
 pip install gptme-contrib
 
@@ -38,6 +40,7 @@ No custom tools in this repository yet. Check back later!
 
 <!--
 ```python
+
 # In your gptme config:
 TOOL_MODULES = "gptme.tools,gptme_contrib.tools"
 ```
@@ -48,6 +51,7 @@ TOOL_MODULES = "gptme.tools,gptme_contrib.tools"
 Scripts can be used directly via the shell tool:
 
 ```bash
+
 # Make scripts executable
 chmod +x scripts/twitter.py
 
