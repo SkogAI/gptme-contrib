@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# B
+echo "running .skogai/git/b"
+git add .
+# git show-ref --verify --quiet refs/heads/feature/skogai2 || git branch feature/skogai2
+# git-flow feature finish skogai2
