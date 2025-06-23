@@ -25,6 +25,7 @@ classifiers = [
 # Minimal core dependencies
 dependencies = [
     "gptme>=0.25.0",
+    "gptme-rag>=0.5.1",
 ]
 
 [tool.ruff]
