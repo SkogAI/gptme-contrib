@@ -1,3 +1,4 @@
 scripts/discord/logs/*
 scripts/*/.env
 scripts/.env
+.aider*
