@@ -17,10 +17,15 @@ Script tools are standalone scripts that can be run via the shell tool. This is 
 Example script tool in Python, using `uv` script dependencies:
 
 ```python
+
 #!/usr/bin/env -S uv run
+
 # dependencies = [
+
 #   "requests>=2.31.0",
+
 #   "rich>=13.7.0",
+
 # ]
 
 import sys

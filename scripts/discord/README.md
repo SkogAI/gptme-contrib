@@ -136,7 +136,9 @@ Each channel maintains its own:
 - Configuration
 
 ## Directory Structure
+
 ## Directory Structure
+
 ## Directory Structure
 ```text
 logs/discord/              # Root directory for Discord data
@@ -229,6 +231,7 @@ The bot uses mypy for static type checking. Configuration is in `mypy.ini`.
 
 To run type checking:
 ```bash
+
 # Using mypy directly
 mypy discord_bot.py
 

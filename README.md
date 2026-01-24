@@ -30,6 +30,7 @@ No custom tools in this repository yet. Check back later!
 
 <!--
 ```python
+
 # In your gptme config:
 TOOL_MODULES = "gptme.tools,gptme_contrib.tools"
 ```
@@ -40,6 +41,7 @@ TOOL_MODULES = "gptme.tools,gptme_contrib.tools"
 Scripts can be used directly via the shell tool:
 
 ```bash
+
 # Make scripts executable
 chmod +x scripts/twitter.py
 
