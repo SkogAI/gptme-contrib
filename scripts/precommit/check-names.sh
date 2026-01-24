@@ -100,6 +100,7 @@ case "$MODE" in
         # Fork validation: ensure template name replaced in code
         # Auto-exclude documentation areas where template references provide context
         FORK_EXCLUDES="$EXCLUDES"
+        FORK_EXCLUDES="$FORK_EXCLUDES :!gptme-contrib/"  # Exclude submodule
         FORK_EXCLUDES="$FORK_EXCLUDES :!docs/ :!knowledge/ :!journal/ :!lessons/ :!skills/"
         FORK_EXCLUDES="$FORK_EXCLUDES :!*.md"  # Markdown docs can reference template
         FORK_EXCLUDES="$FORK_EXCLUDES :!dotfiles/.config/git/hooks/"
