@@ -1075,6 +1075,9 @@ provides-extras = ["dev", "test"]
 name = "gptme-contrib-workspace"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "gptmail" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1086,6 +1089,7 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "gptmail", editable = "packages/gptmail" }]
 
 [package.metadata.requires-dev]
 dev = [

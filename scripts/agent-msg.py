@@ -175,7 +175,7 @@ def send_message(
     agent = agents[recipient]
     ssh_target = agent["ssh"]
     workspace = agent["workspace"]
-    remote_inbox = f"{workspace}/messages/inbox/"
+    remote_inbox = f"{workspace}/.skogai/email/inbox/"
 
     # Ensure remote inbox exists
     try:
