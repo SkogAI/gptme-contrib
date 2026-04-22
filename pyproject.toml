@@ -5,6 +5,14 @@ description = "Community contributions and utilities for gptme agents"
 requires-python = ">=3.10"
 dependencies = [
     "gptmail",
+    "gptme-activity-summary",
+    "gptme-dashboard",
+    "gptme-forum",
+    "gptme-runloops",
+    "gptme-sessions",
+    "gptme-voice",
+    "gptme-whatsapp",
+    "gptodo",
 ]
 
 [dependency-groups]
@@ -26,9 +34,15 @@ exclude = ["packages/__pycache__", "plugins/__pycache__", "packages/tasks", "pac
 
 [tool.uv.sources]
 gptme = { git = "https://github.com/gptme/gptme.git", branch = "master" }
+gptme-forum = { workspace = true }
+gptme-voice = { workspace = true }
 gptme-sessions = { workspace = true }
+gptme-activity-summary = { workspace = true }
 gptodo = { workspace = true }
+gptme-runloops = { workspace = true }
+gptme-whatsapp = { workspace = true }
 gptmail = { workspace = true }
+gptme-dashboard = { workspace = true }
 
 [tool.pytest.ini_options]
 # Required for cross-package test collection (pytest packages/)

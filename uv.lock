@@ -1362,6 +1362,14 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "gptmail" },
+    { name = "gptme-activity-summary" },
+    { name = "gptme-dashboard" },
+    { name = "gptme-forum" },
+    { name = "gptme-runloops" },
+    { name = "gptme-sessions" },
+    { name = "gptme-voice" },
+    { name = "gptme-whatsapp" },
+    { name = "gptodo" },
 ]
 
 [package.dev-dependencies]
@@ -1374,7 +1382,17 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "gptmail", editable = "packages/gptmail" }]
+requires-dist = [
+    { name = "gptmail", editable = "packages/gptmail" },
+    { name = "gptme-activity-summary", editable = "packages/gptme-activity-summary" },
+    { name = "gptme-dashboard", editable = "packages/gptme-dashboard" },
+    { name = "gptme-forum", editable = "packages/gptme-forum" },
+    { name = "gptme-runloops", editable = "packages/gptme-runloops" },
+    { name = "gptme-sessions", editable = "packages/gptme-sessions" },
+    { name = "gptme-voice", editable = "packages/gptme-voice" },
+    { name = "gptme-whatsapp", editable = "packages/gptme-whatsapp" },
+    { name = "gptodo", editable = "packages/gptodo" },
+]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1427,9 +1445,9 @@ test = [
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "flask", marker = "extra == 'serve'", specifier = ">=3.0" },
-    { name = "gptme-dashboard", extras = ["serve"], marker = "extra == 'test'" },
-    { name = "gptme-dashboard", extras = ["tasks"], marker = "extra == 'test'" },
-    { name = "gptme-dashboard", extras = ["test"], marker = "extra == 'dev'" },
+    { name = "gptme-dashboard", extras = ["serve"], marker = "extra == 'test'", editable = "packages/gptme-dashboard" },
+    { name = "gptme-dashboard", extras = ["tasks"], marker = "extra == 'test'", editable = "packages/gptme-dashboard" },
+    { name = "gptme-dashboard", extras = ["test"], marker = "extra == 'dev'", editable = "packages/gptme-dashboard" },
     { name = "gptme-sessions", marker = "extra == 'serve'", editable = "packages/gptme-sessions" },
     { name = "gptme-sessions", marker = "extra == 'sessions'", editable = "packages/gptme-sessions" },
     { name = "gptodo", marker = "extra == 'tasks'", editable = "packages/gptodo" },
