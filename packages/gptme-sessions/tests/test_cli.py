@@ -258,12 +258,106 @@ class TestStatsCommand:
         assert rc == 0
         assert "discover" in out.lower() or "sync" in out.lower() or "session" in out.lower()
 
+    def test_stats_empty_store_no_duplicate_hint(self, tmp_path: Path):
+        """stats on empty store with discovered sessions shows sync hint exactly once.
+
+        _show_discovery_fallback already prints a sync recommendation; the new
+        _count_unsynced hint must be suppressed in this code path to avoid
+        printing two nearly identical sync suggestions.
+        """
+        from unittest.mock import patch
+
+        SessionStore(sessions_dir=tmp_path)
+        fake_discovered = [
+            {"harness": "claude-code", "path": Path("/fake/session1.jsonl")},
+        ]
+        with patch("gptme_sessions.cli._discover_all", return_value=fake_discovered):
+            rc, out = _invoke(["stats"], tmp_path)
+        assert rc == 0
+        # Exactly one sync recommendation — not two
+        assert (
+            out.count("gptme-sessions sync") == 1
+        ), f"Expected exactly one sync recommendation, got:\n{out}"
+
     def test_stats_no_matches_with_filter(self, tmp_path: Path):
         """stats with filter that matches nothing shows appropriate message."""
         _seed_store(tmp_path)
         rc, out = _invoke(["stats", "--model", "nonexistent"], tmp_path)
         assert rc == 0
         assert "no records" in out.lower()
+
+    def test_stats_no_matches_shows_unsynced_hint(self, tmp_path: Path):
+        """stats with filter that matches nothing shows hint when unsynced sessions exist."""
+        from unittest.mock import patch
+
+        _seed_store(tmp_path)
+        # Mock _discover_all to return fake unsynced sessions
+        fake_discovered = [
+            {"harness": "claude-code", "path": Path("/fake/session1.jsonl")},
+            {"harness": "gptme", "path": Path("/fake/session2.jsonl")},
+        ]
+        with patch("gptme_sessions.cli._discover_all", return_value=fake_discovered):
+            rc, out = _invoke(["stats", "--model", "nonexistent"], tmp_path)
+        assert rc == 0
+        assert "no records" in out.lower()
+        assert "hint" in out.lower()
+        assert "2 session(s) discovered but not synced" in out
+        assert "sync" in out
+
+    def test_stats_no_matches_no_hint_when_all_synced(self, tmp_path: Path):
+        """stats with filter that matches nothing shows no hint when all sessions are synced."""
+        from unittest.mock import patch
+
+        _seed_store(tmp_path)
+        # Mock _discover_all to return empty (nothing to sync)
+        with patch("gptme_sessions.cli._discover_all", return_value=[]):
+            rc, out = _invoke(["stats", "--model", "nonexistent"], tmp_path)
+        assert rc == 0
+        assert "no records" in out.lower()
+        assert "hint" not in out.lower()
+
+    def test_stats_no_matches_no_hint_when_synced_via_trajectory_path(self, tmp_path: Path):
+        """stats shows no hint when discovered sessions are already synced via trajectory_path.
+
+        This is the primary sync workflow: sync writes trajectory_path (not journal_path)
+        on imported records, so _count_unsynced must check both fields.
+        """
+        from unittest.mock import patch
+
+        store = SessionStore(sessions_dir=tmp_path)
+        fake_paths = ["/fake/logs/session1.jsonl", "/fake/logs/session2.jsonl"]
+        for path in fake_paths:
+            r = SessionRecord(
+                harness="claude-code",
+                model="sonnet",
+                run_type="autonomous",
+                category="code",
+                outcome="productive",
+                duration_seconds=600,
+                trajectory_path=path,
+            )
+            store.append(r)
+
+        fake_discovered = [{"harness": "claude-code", "path": Path(p)} for p in fake_paths]
+        with patch("gptme_sessions.cli._discover_all", return_value=fake_discovered):
+            rc, out = _invoke(["stats", "--model", "nonexistent"], tmp_path)
+        assert rc == 0
+        assert "no records" in out.lower()
+        assert "hint" not in out.lower(), f"False-positive hint shown:\n{out}"
+
+    def test_stats_with_results_shows_unsynced_hint(self, tmp_path: Path):
+        """stats with matching results still shows hint when unsynced sessions exist."""
+        from unittest.mock import patch
+
+        _seed_store(tmp_path)
+        fake_discovered = [
+            {"harness": "claude-code", "path": Path("/fake/new-session.jsonl")},
+        ]
+        with patch("gptme_sessions.cli._discover_all", return_value=fake_discovered):
+            rc, out = _invoke(["stats"], tmp_path)
+        assert rc == 0
+        assert "hint" in out.lower()
+        assert "1 session(s) discovered but not synced" in out
 
     def test_stats_shows_model_breakdown(self, tmp_path: Path):
         """stats --json includes per-model breakdown."""
@@ -564,6 +658,56 @@ class TestSyncTimestamp:
             # The timestamp should start with the session date, not today
             assert gptme_records[0].timestamp.startswith("2026-03-10")
 
+    def test_sync_imports_real_start_time_from_trajectory(self, tmp_path: Path):
+        """sync should record the real start time, not a noon-UTC placeholder.
+
+        Regression test: previously, every synced Claude Code session landed at
+        YYYY-MM-DDT12:00:00 because sync only had a date, not a datetime.  This
+        collapsed 100+ sessions into a single hour and produced bogus noop
+        spikes in downstream analytics (bandit, inference-review).
+        """
+        # CLAUDE_HOME points at a directory containing a `projects/` subdir
+        claude_home = tmp_path / "cc"
+        proj = claude_home / "projects" / "-home-user-proj"
+        proj.mkdir(parents=True)
+        traj = proj / "abc12345-aaaa-bbbb-cccc-ddddeeeeffff.jsonl"
+        # File must exceed CC_MIN_SESSION_SIZE (4096 bytes) so it isn't filtered
+        # out as a stub session by discover_cc_sessions.
+        lines = [
+            json.dumps({"type": "system", "timestamp": "2026-04-15T22:42:48Z"}),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-04-15T22:43:00Z",
+                    "message": {"role": "assistant", "content": "x" * 5000},
+                }
+            ),
+        ]
+        traj.write_text("\n".join(lines) + "\n")
+
+        store_dir = tmp_path / "store"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--sessions-dir",
+                str(store_dir),
+                "sync",
+                "--harness",
+                "claude-code",
+                "--since",
+                "all",
+            ],
+            env={"CLAUDE_HOME": str(claude_home)},
+        )
+        assert result.exit_code == 0
+
+        store = SessionStore(sessions_dir=store_dir)
+        cc_records = [r for r in store.load_all() if r.harness == "claude-code"]
+        assert len(cc_records) == 1
+        # Must preserve the real hour/minute/second — not the noon placeholder
+        assert cc_records[0].timestamp.startswith("2026-04-15T22:42:48")
+
 
 class TestSyncFixTimestamps:
     def test_fix_timestamps_corrects_records(self, tmp_path: Path):
@@ -589,6 +733,83 @@ class TestSyncFixTimestamps:
         records = store.load_all()
         assert records[0].timestamp.startswith("2026-03-10")
 
+    def test_fix_timestamps_restores_real_time_from_trajectory(self, tmp_path: Path):
+        """--fix-timestamps restores the real start time (not noon placeholder).
+
+        Regression test for the noon-UTC placeholder bug: when sync imports a
+        trajectory without extracting its first-event timestamp, every record
+        lands at YYYY-MM-DDT12:00:00 with duration_seconds=0, collapsing the
+        hourly distribution.  --fix-timestamps must detect these placeholders
+        and recover the real start time from the trajectory file.
+        """
+        # Create a real Claude Code trajectory with a non-noon start time
+        traj_dir = tmp_path / "projects" / "-home-user-proj"
+        traj_dir.mkdir(parents=True)
+        traj = traj_dir / "abc12345-0000-0000-0000-000000000000.jsonl"
+        traj.write_text(json.dumps({"type": "system", "timestamp": "2026-04-15T22:42:48Z"}) + "\n")
+
+        # Seed a placeholder record pointing at that trajectory
+        store = SessionStore(sessions_dir=tmp_path / "store")
+        store.append(
+            SessionRecord(
+                harness="claude-code",
+                timestamp="2026-04-15T12:00:00+00:00",  # noon placeholder
+                duration_seconds=0,
+                trajectory_path=str(traj),
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--sessions-dir", str(tmp_path / "store"), "sync", "--fix-timestamps"],
+        )
+        assert result.exit_code == 0
+        assert "Fixed 1 timestamp" in result.output
+
+        rec = store.load_all()[0]
+        assert rec.timestamp.startswith("2026-04-15T22:42:48")
+
+    def test_fix_timestamps_restores_noon_placeholder_with_backfilled_duration(
+        self, tmp_path: Path
+    ):
+        """--fix-timestamps also repairs noon-placeholders whose duration was backfilled.
+
+        Regression for Greptile P1 on PR #668: records synced before the fix had
+        duration_seconds=0 and noon timestamps. Later sync --with-signals runs
+        populated duration_seconds to a non-zero value. The original detector
+        required duration_seconds == 0, so these already-backfilled records were
+        silently skipped. Detection should key on the synthetic noon timestamp
+        itself, not on duration_seconds.
+        """
+        traj_dir = tmp_path / "projects" / "-home-user-proj"
+        traj_dir.mkdir(parents=True)
+        traj = traj_dir / "def67890-0000-0000-0000-000000000000.jsonl"
+        traj.write_text(json.dumps({"type": "system", "timestamp": "2026-04-15T09:15:22Z"}) + "\n")
+
+        store = SessionStore(sessions_dir=tmp_path / "store")
+        store.append(
+            SessionRecord(
+                harness="claude-code",
+                timestamp="2026-04-15T12:00:00+00:00",  # noon placeholder
+                duration_seconds=1847,  # backfilled by --with-signals
+                trajectory_path=str(traj),
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--sessions-dir", str(tmp_path / "store"), "sync", "--fix-timestamps"],
+        )
+        assert result.exit_code == 0
+        assert "Fixed 1 timestamp" in result.output
+
+        rec = store.load_all()[0]
+        assert rec.timestamp.startswith("2026-04-15T09:15:22")
+        # Duration preserved — we only fix the timestamp, not the duration.
+        assert rec.duration_seconds == 1847
+
 
 # -- stats defaults ----------------------------------------------------------
 
@@ -612,6 +833,8 @@ class TestStatsDefaults:
 
     def test_stats_old_records_no_misleading_fallback(self, tmp_path: Path):
         """stats on store with only old records shows a helpful message, not 'run sync'."""
+        from unittest.mock import patch
+
         store = SessionStore(sessions_dir=tmp_path)
         # Insert a record with a timestamp far in the past (outside the implicit 30d window)
         old_record = SessionRecord(
@@ -620,7 +843,8 @@ class TestStatsDefaults:
             timestamp="2020-01-01T00:00:00+00:00",
         )
         store.append(old_record)
-        rc, out = _invoke(["stats"], tmp_path)
+        with patch("gptme_sessions.cli._discover_all", return_value=[]):
+            rc, out = _invoke(["stats"], tmp_path)
         assert rc == 0
         # Should NOT tell the user to run sync (misleading — data is already synced)
         assert "sync" not in out.lower()
@@ -674,3 +898,47 @@ class TestProjectFilter:
         data = json.loads(out)
         assert len(data) == 1
         assert data[0]["project"] == "/Users/erb/myproject"
+
+
+class TestRepairGradesCommand:
+    def test_repair_grades_backfills_legacy_fields(self, tmp_path: Path):
+        """repair-grades persists multivariate grade fields for legacy records."""
+        store = SessionStore(sessions_dir=tmp_path)
+        legacy = SessionRecord(
+            session_id="legacy-sync",
+            harness="claude-code",
+            model="opus",
+            trajectory_grade=0.64,
+            llm_judge_score=0.82,
+            llm_judge_reason="Strong execution on the active task.",
+        )
+        store.append(legacy)
+
+        rc, out = _invoke(["repair-grades"], tmp_path)
+
+        assert rc == 0
+        assert "Repaired 1 record(s)" in out
+
+        repaired = SessionStore(sessions_dir=tmp_path).load_all()[0]
+        assert repaired.grades == {"productivity": 0.64, "alignment": 0.82}
+        assert repaired.grade_reasons == {"alignment": "Strong execution on the active task."}
+
+    def test_repair_grades_dry_run_does_not_rewrite_store(self, tmp_path: Path):
+        """repair-grades --dry-run reports changes without persisting them."""
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(
+            SessionRecord(
+                session_id="legacy-dry-run",
+                harness="claude-code",
+                model="opus",
+                trajectory_grade=0.58,
+            )
+        )
+
+        rc, out = _invoke(["repair-grades", "--dry-run"], tmp_path)
+
+        assert rc == 0
+        assert "Would repair 1 record(s)" in out
+
+        persisted = SessionStore(sessions_dir=tmp_path).load_all()[0]
+        assert persisted.grades == {}

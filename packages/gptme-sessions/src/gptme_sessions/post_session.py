@@ -21,7 +21,9 @@ What this function does **not** do (kept in caller scripts):
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,44 @@ from .signals import extract_from_path
 from .store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+#: Default path for grading weights config (Phase 3 multivariate grading).
+_GRADING_WEIGHTS_PATH = (
+    Path(__file__).resolve().parent.parent.parent.parent.parent.parent
+    / "state"
+    / "grading-weights.json"
+)
+
+#: Fallback weights when config file is not found.
+_DEFAULT_WEIGHTS: dict[str, float] = {
+    "productivity": 0.40,
+    "alignment": 0.35,
+    "harm": 0.25,
+}
+
+
+def load_grading_weights() -> dict[str, float]:
+    """Load grading weights from state/grading-weights.json, with fallback."""
+    # Try to find grading-weights.json by walking up from this file
+    path = _GRADING_WEIGHTS_PATH
+    if path.exists():
+        try:
+            data: dict[str, float] = json.loads(path.read_text())
+            return data
+        except Exception as e:
+            logger.warning("Failed to load grading weights from %s: %s", path, e)
+    # Try environment variable for agent workspace
+    agent_path = os.environ.get("AGENT_PATH") or os.environ.get("GPTME_AGENT_PATH")
+    if agent_path:
+        alt = Path(agent_path) / "state" / "grading-weights.json"
+        if alt.exists():
+            try:
+                alt_data: dict[str, float] = json.loads(alt.read_text())
+                return alt_data
+            except Exception as e:
+                logger.warning("Failed to load grading weights from %s: %s", alt, e)
+    return _DEFAULT_WEIGHTS
+
 
 #: Valid values for the ``context_tier`` parameter.  Exported so ``cli.py``
 #: can use a single source of truth for ``click.Choice``.
@@ -46,19 +86,27 @@ class PostSessionResult:
     """Return value from :func:`post_session`.
 
     Attributes:
-        record:      The :class:`SessionRecord` that was appended to the store.
-        grade:       Graded reward (0.0–1.0) extracted from the trajectory, or
-                     ``None`` if no trajectory was available.
-        signals:     Raw signal dict from :func:`~gptme_sessions.signals.extract_from_path`,
-                     or ``None`` if no trajectory was available.
-        token_count: Total token count from the trajectory (CC format only),
-                     or ``None`` if not available.
+        record:                The :class:`SessionRecord` that was appended to the store.
+        grade:                 Graded reward (0.0–1.0) extracted from the trajectory, or
+                               ``None`` if no trajectory was available.
+        signals:               Raw signal dict from :func:`~gptme_sessions.signals.extract_from_path`,
+                               or ``None`` if no trajectory was available.
+        token_count:           Total token count from the trajectory (CC format only),
+                               or ``None`` if not available.
+        input_tokens:          Input tokens from usage breakdown, or ``None`` if not present.
+        output_tokens:         Output tokens from usage breakdown, or ``None`` if not present.
+        cache_creation_tokens: Cache-write tokens, or ``None`` if not present.
+        cache_read_tokens:     Cache-read tokens, or ``None`` if not present.
     """
 
     record: SessionRecord
     grade: float | None = None
     signals: dict[str, Any] | None = None
     token_count: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_read_tokens: int | None = None
 
 
 def post_session(
@@ -172,6 +220,10 @@ def post_session(
     grade: float | None = None
     signals: dict[str, Any] | None = None
     token_count: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_read_tokens: int | None = None
     traj_productive: bool | None = None
 
     # --- Extract signals from trajectory ---
@@ -181,10 +233,20 @@ def post_session(
             signals = result
             grade = result.get("grade")
             traj_productive = result.get("productive")
-            usage = result.get("usage") or {}
-            total = usage.get("total_tokens", 0)
-            if total:
-                token_count = int(total)
+            usage = result.get("usage")
+            if usage:
+                _in = usage.get("input_tokens")
+                _out = usage.get("output_tokens")
+                _cc = usage.get("cache_creation_tokens")
+                _cr = usage.get("cache_read_tokens")
+                input_tokens = int(_in) if _in is not None else None
+                output_tokens = int(_out) if _out is not None else None
+                cache_creation_tokens = int(_cc) if _cc is not None else None
+                cache_read_tokens = int(_cr) if _cr is not None else None
+            if isinstance(usage, dict) and "total_tokens" in usage:
+                total = usage.get("total_tokens")
+                if total is not None:
+                    token_count = int(total)
         except Exception as e:
             # Signal extraction is non-fatal; proceed without signals
             logger.warning("Signal extraction from %s failed: %s", trajectory_path, e)
@@ -301,10 +363,21 @@ def post_session(
         record_kwargs["session_id"] = session_id
     if token_count is not None:
         record_kwargs["token_count"] = token_count
-    if grade is not None:
-        record_kwargs["trajectory_grade"] = grade
-
+    if input_tokens is not None:
+        record_kwargs["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        record_kwargs["output_tokens"] = output_tokens
+    if cache_creation_tokens is not None:
+        record_kwargs["cache_creation_tokens"] = cache_creation_tokens
+    if cache_read_tokens is not None:
+        record_kwargs["cache_read_tokens"] = cache_read_tokens
     record = SessionRecord(**record_kwargs)
+    if grade is not None:
+        record.set_productivity_grade(grade)
+        # NOTE: Weighted multi-dim combine (productivity × alignment × harm)
+        # is handled by compute-harm-signal.py after harm grades are computed.
+        # At post_session time only productivity is available, so there is
+        # nothing to combine yet.
     if journal_path is not None:
         try:
             existing_session_ids = [
@@ -334,4 +407,8 @@ def post_session(
         grade=grade,
         signals=signals,
         token_count=token_count,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
     )

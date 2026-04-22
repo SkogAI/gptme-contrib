@@ -9,16 +9,30 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gptme.message import Message
 
 from gptme_sessions.judge import (
     DEFAULT_GOALS,
     DEFAULT_JUDGE_MODEL,
+    JUDGE_VERSION,
     JUDGE_PROMPT_TEMPLATE,
     JUDGE_SYSTEM,
+    NO_THINK_PREFILL,
+    _get_api_key,
+    _judge_openrouter_env,
+    _parse_judge_payload,
+    _prepare_messages_for_model,
+    _resolve_openrouter_api_key,
+    _is_anthropic_direct_model,
+    _strip_anthropic_prefix,
+    judge_and_writeback,
     judge_from_signals,
     judge_session,
+    judge_session_with_fallback,
+    normalize_judge_verdict,
 )
 from gptme_sessions.record import SessionRecord
+from gptme_sessions.store import SessionStore
 
 
 class TestJudgeSession:
@@ -133,6 +147,146 @@ class TestJudgeSession:
         assert "Bob" not in DEFAULT_GOALS
         assert "agent" in DEFAULT_GOALS.lower()
 
+    def test_parse_judge_payload_handles_think_tags_and_fences(self) -> None:
+        parsed = _parse_judge_payload(
+            """
+<think>internal</think>
+```json
+{"score": 1.4, "reason": "Shipped a real fix"}
+```
+""",
+            "openai-subscription/gpt-5.4",
+        )
+
+        assert parsed == {
+            "score": 1.0,
+            "reason": "Shipped a real fix",
+            "model": "openai-subscription/gpt-5.4",
+        }
+
+    def test_prepare_messages_for_qwen_adds_no_think_prefill(self) -> None:
+        prepared = _prepare_messages_for_model(
+            [Message("system", "judge"), Message("user", "score this")],
+            "lmstudio/qwen/qwen3.6-35b-a3b",
+        )
+
+        assert [msg.role for msg in prepared] == ["system", "user", "assistant"]
+        assert prepared[-1].content == NO_THINK_PREFILL
+
+    def test_prepare_messages_for_other_models_is_noop(self) -> None:
+        messages = [Message("system", "judge"), Message("user", "score this")]
+
+        prepared = _prepare_messages_for_model(
+            messages,
+            "openai-subscription/gpt-5.4",
+        )
+
+        assert prepared == messages
+
+
+class TestJudgeSessionWithFallback:
+    """Tests for judge_session_with_fallback()."""
+
+    def test_returns_primary_on_success(self, monkeypatch) -> None:
+        """When the primary model succeeds, return its result without trying fallbacks."""
+        calls: list[str] = []
+
+        def _fake_judge_session(text, category=None, *, goals, model, **kw):
+            calls.append(model)
+            return {"score": 0.8, "reason": "Primary worked", "model": model}
+
+        monkeypatch.setattr("gptme_sessions.judge.judge_session", _fake_judge_session)
+
+        result = judge_session_with_fallback(
+            "session text",
+            goals="ship useful work",
+            fallback_models=("fallback/model-a",),
+        )
+
+        assert result is not None
+        assert result["score"] == 0.8
+        assert calls == [DEFAULT_JUDGE_MODEL]
+
+    def test_tries_fallback_after_primary_fails(self, monkeypatch) -> None:
+        """When the primary fails, the first fallback model is used."""
+        calls: list[str] = []
+
+        def _fake_judge_session(text, category=None, *, goals, model, **kw):
+            calls.append(model)
+            if model == DEFAULT_JUDGE_MODEL:
+                return None
+            return {"score": 0.7, "reason": "Fallback worked", "model": model}
+
+        monkeypatch.setattr("gptme_sessions.judge.judge_session", _fake_judge_session)
+
+        result = judge_session_with_fallback(
+            "session text",
+            goals="ship useful work",
+            fallback_models=("fallback/model-a", "fallback/model-b"),
+        )
+
+        assert result is not None
+        assert result["score"] == 0.7
+        assert calls == [DEFAULT_JUDGE_MODEL, "fallback/model-a"]
+
+    def test_returns_none_when_all_models_fail(self, monkeypatch) -> None:
+        """Returns None when every model in the chain fails."""
+        monkeypatch.setattr(
+            "gptme_sessions.judge.judge_session",
+            lambda *a, **kw: None,
+        )
+
+        result = judge_session_with_fallback(
+            "session text",
+            goals="ship useful work",
+            fallback_models=("fallback/model-a",),
+        )
+
+        assert result is None
+
+    def test_no_fallbacks_uses_default_model_only(self, monkeypatch) -> None:
+        """With no fallback_models, only the default model is tried."""
+        calls: list[str] = []
+
+        def _fake_judge_session(text, category=None, *, goals, model, **kw):
+            calls.append(model)
+            return None
+
+        monkeypatch.setattr("gptme_sessions.judge.judge_session", _fake_judge_session)
+
+        result = judge_session_with_fallback("session text", goals="ship work")
+        assert result is None
+        assert calls == [DEFAULT_JUDGE_MODEL]
+
+
+class TestJudgeAndWritebackFallback:
+    """Tests for judge_and_writeback() fallback_models parameter."""
+
+    def test_uses_fallback_when_provided(self, tmp_path: Path, monkeypatch) -> None:
+        """When fallback_models is given, judge_session_with_fallback is used."""
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(SessionRecord(session_id="sid1", outcome="productive"))
+
+        calls: list[str] = []
+
+        def _fake_fallback(text, category=None, *, goals, default_model, fallback_models, **kw):
+            calls.append(("fallback", default_model, fallback_models))
+            return {"score": 0.75, "reason": "Fallback judge", "model": "fallback/m"}
+
+        monkeypatch.setattr("gptme_sessions.judge.judge_session_with_fallback", _fake_fallback)
+
+        result = judge_and_writeback(
+            text="text",
+            category="code",
+            goals="ship work",
+            session_id="sid1",
+            sessions_dir=tmp_path,
+            fallback_models=("fallback/m",),
+        )
+
+        assert result["status"] == "ok"
+        assert calls == [("fallback", DEFAULT_JUDGE_MODEL, ("fallback/m",))]
+
 
 class TestJudgeFromSignals:
     """Tests for judge_from_signals()."""
@@ -192,6 +346,145 @@ class TestJudgeFromSignals:
             assert call_args[1]["model"] == "custom-model"
 
 
+class TestModelRouting:
+    """Tests for Anthropic-direct vs gptme.llm routing logic."""
+
+    def test_bare_claude_id_is_direct(self) -> None:
+        assert _is_anthropic_direct_model("claude-haiku-4-5-20251001") is True
+        assert _is_anthropic_direct_model("claude-sonnet-4-5") is True
+
+    def test_anthropic_prefix_is_direct(self) -> None:
+        assert _is_anthropic_direct_model("anthropic/claude-sonnet-4.6") is True
+        assert _is_anthropic_direct_model("anthropic/claude-haiku-4-5-20251001") is True
+
+    def test_provider_prefixed_is_not_direct(self) -> None:
+        assert _is_anthropic_direct_model("openrouter/anthropic/claude-sonnet-4.6") is False
+        assert _is_anthropic_direct_model("openai-subscription/gpt-5.4") is False
+        assert _is_anthropic_direct_model("lmstudio/qwen/qwen3.6-35b-a3b") is False
+        assert _is_anthropic_direct_model("openai/gpt-4o") is False
+
+    def test_strip_anthropic_prefix(self) -> None:
+        assert _strip_anthropic_prefix("anthropic/claude-sonnet-4.6") == "claude-sonnet-4.6"
+        assert _strip_anthropic_prefix("claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
+        # Non-anthropic prefixes are left alone
+        assert (
+            _strip_anthropic_prefix("openrouter/anthropic/claude-sonnet-4.6")
+            == "openrouter/anthropic/claude-sonnet-4.6"
+        )
+
+    def test_non_anthropic_model_routes_via_gptme(self) -> None:
+        """Non-Anthropic-direct models call _judge_via_gptme, not _judge_via_anthropic_direct."""
+        with (
+            patch(
+                "gptme_sessions.judge._judge_via_gptme",
+                return_value={"score": 0.6, "reason": "ok", "model": "openrouter/x"},
+            ) as mock_gptme,
+            patch("gptme_sessions.judge._judge_via_anthropic_direct") as mock_direct,
+        ):
+            result = judge_session(
+                "journal text", category="code", model="openrouter/anthropic/claude-sonnet-4.6"
+            )
+        assert result is not None
+        assert result["score"] == 0.6
+        mock_gptme.assert_called_once()
+        mock_direct.assert_not_called()
+
+    def test_anthropic_direct_model_routes_via_anthropic(self) -> None:
+        """Bare Anthropic IDs call _judge_via_anthropic_direct, not _judge_via_gptme."""
+        with (
+            patch(
+                "gptme_sessions.judge._judge_via_anthropic_direct",
+                return_value={"score": 0.7, "reason": "ok", "model": "claude-haiku-4-5-20251001"},
+            ) as mock_direct,
+            patch("gptme_sessions.judge._judge_via_gptme") as mock_gptme,
+        ):
+            result = judge_session("journal text", category="code")
+        assert result is not None
+        assert result["score"] == 0.7
+        mock_direct.assert_called_once()
+        mock_gptme.assert_not_called()
+
+    def test_gptme_path_returns_none_when_gptme_missing(self) -> None:
+        """When gptme is not installed, non-Anthropic models get None cleanly."""
+        with patch.dict(
+            "sys.modules",
+            {"gptme": None, "gptme.init": None, "gptme.llm": None, "gptme.message": None},
+        ):
+            result = judge_session(
+                "journal text", category="code", model="openrouter/anthropic/claude-sonnet-4.6"
+            )
+        assert result is None
+
+    def test_resolve_openrouter_api_key_prefers_scoped_env(self) -> None:
+        env = {
+            "OPENROUTER_API_KEY_JUDGE": "judge-key",
+            "OPENROUTER_API_KEY": "shared-key",
+        }
+
+        assert _resolve_openrouter_api_key("judge", environ=env) == "judge-key"
+
+    def test_resolve_openrouter_api_key_reads_config_local(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text('[env]\nOPENROUTER_API_KEY = "shared-key"\n', encoding="utf-8")
+        config_local = tmp_path / "config.local.toml"
+        config_local.write_text(
+            '[env]\nOPENROUTER_API_KEY_JUDGE = "judge-key"\n',
+            encoding="utf-8",
+        )
+
+        assert (
+            _resolve_openrouter_api_key(
+                "judge",
+                environ={},
+                config_paths=(config, config_local),
+            )
+            == "judge-key"
+        )
+
+    def test_get_api_key_reads_config_local(self, tmp_path: Path, monkeypatch) -> None:
+        """_get_api_key() falls back to config.local.toml, not just config.toml."""
+        config = tmp_path / "config.toml"
+        config.write_text("[env]\n", encoding="utf-8")
+        config_local = tmp_path / "config.local.toml"
+        config_local.write_text('[env]\nANTHROPIC_API_KEY = "local-key"\n', encoding="utf-8")
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert _get_api_key(config_paths=(config, config_local)) == "local-key"
+
+    def test_judge_openrouter_env_promotes_scoped_key(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "gptme_sessions.judge._resolve_openrouter_api_key",
+            lambda *args, **kwargs: "judge-key",
+        )
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        seen: list[str | None] = []
+        with _judge_openrouter_env("openrouter/qwen/qwen3-next-80b"):
+            seen.append(os.environ.get("OPENROUTER_API_KEY"))
+
+        assert seen == ["judge-key"]
+        assert "OPENROUTER_API_KEY" not in os.environ
+
+    def test_normalize_judge_verdict_attaches_meta(self) -> None:
+        normalized = normalize_judge_verdict(
+            {
+                "score": 0.74,
+                "reason": "Meaningful progress",
+                "model": "openai-subscription/gpt-5.4",
+            }
+        )
+
+        assert normalized == {
+            "score": 0.74,
+            "reason": "Meaningful progress",
+            "model": "openai-subscription/gpt-5.4",
+            "meta": {
+                "backend": "gptme-fallback",
+                "judge_version": JUDGE_VERSION,
+            },
+        }
+
+
 class TestSessionRecordJudgeFields:
     """Tests for LLM judge fields on SessionRecord."""
 
@@ -232,6 +525,131 @@ class TestSessionRecordJudgeFields:
         record = SessionRecord.from_dict(old_data)
         assert record.llm_judge_score is None
 
+    def test_writeback_helpers_store_alignment_meta(self, tmp_path: Path) -> None:
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(SessionRecord(session_id="abc123", outcome="productive"))
+
+        with patch(
+            "gptme_sessions.judge.judge_session",
+            return_value={
+                "score": 0.74,
+                "reason": "Real work shipped",
+                "model": "openai-subscription/gpt-5.4",
+            },
+        ):
+            result = judge_and_writeback(
+                text="session text",
+                category="code",
+                goals="ship useful work",
+                session_id="abc123",
+                sessions_dir=tmp_path,
+                model="openai-subscription/gpt-5.4",
+            )
+
+        assert result["status"] == "ok"
+        updated = SessionStore(sessions_dir=tmp_path).load_all()[0]
+        assert updated.grades["alignment"] == 0.74
+        assert updated.grade_reasons["alignment"] == "Real work shipped"
+        assert updated.llm_judge_score == 0.74
+        assert updated.llm_judge_reason == "Real work shipped"
+        assert updated.llm_judge_model == "openai-subscription/gpt-5.4"
+        assert updated.to_dict()["llm_judge_meta"] == {
+            "backend": "gptme-fallback",
+            "judge_version": JUDGE_VERSION,
+        }
+
+    def test_writeback_populates_span_aggregates(self, tmp_path: Path) -> None:
+        """write_alignment_grade opportunistically calls populate_span_aggregates."""
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(SessionRecord(session_id="abc123", outcome="productive"))
+
+        with (
+            patch(
+                "gptme_sessions.judge.judge_session",
+                return_value={
+                    "score": 0.74,
+                    "reason": "Real work shipped",
+                    "model": "openai-subscription/gpt-5.4",
+                },
+            ),
+            patch.object(
+                SessionRecord, "populate_span_aggregates", return_value=True
+            ) as mock_populate,
+        ):
+            result = judge_and_writeback(
+                text="session text",
+                category="code",
+                goals="ship useful work",
+                session_id="abc123",
+                sessions_dir=tmp_path,
+                model="openai-subscription/gpt-5.4",
+            )
+
+        assert result["status"] == "ok"
+        mock_populate.assert_called_once()
+
+    def test_writeback_tolerates_span_aggregates_failure(self, tmp_path: Path) -> None:
+        """Writeback still succeeds if span aggregation raises unexpectedly."""
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(SessionRecord(session_id="abc123", outcome="productive"))
+
+        with (
+            patch(
+                "gptme_sessions.judge.judge_session",
+                return_value={
+                    "score": 0.5,
+                    "reason": "Did work",
+                    "model": "openai-subscription/gpt-5.4",
+                },
+            ),
+            patch.object(
+                SessionRecord,
+                "populate_span_aggregates",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            result = judge_and_writeback(
+                text="session text",
+                category="code",
+                goals="ship useful work",
+                session_id="abc123",
+                sessions_dir=tmp_path,
+                model="openai-subscription/gpt-5.4",
+            )
+
+        assert result["status"] == "ok"
+        updated = SessionStore(sessions_dir=tmp_path).load_all()[0]
+        assert updated.grades["alignment"] == 0.5
+
+    def test_judge_and_writeback_reports_missing_record(self, tmp_path: Path) -> None:
+        with patch(
+            "gptme_sessions.judge.judge_session",
+            return_value={
+                "score": 0.5,
+                "reason": "Did work",
+                "model": "openai-subscription/gpt-5.4",
+            },
+        ):
+            result = judge_and_writeback(
+                text="session text",
+                category="code",
+                goals="ship useful work",
+                session_id="missing",
+                sessions_dir=tmp_path,
+                model="openai-subscription/gpt-5.4",
+            )
+
+        assert result == {
+            "status": "no_record",
+            "score": 0.5,
+            "reason": "Did work",
+            "model": "openai-subscription/gpt-5.4",
+            "meta": {
+                "backend": "gptme-fallback",
+                "judge_version": JUDGE_VERSION,
+            },
+        }
+
 
 class TestJudgeCLI:
     """Tests for the judge CLI command."""
@@ -250,6 +668,16 @@ class TestJudgeCLI:
         param_names = [p.name for p in signals_cmd.params]
         assert "llm_judge" in param_names
         assert "goals" in param_names
+
+    def test_judge_and_signals_have_model_flag(self) -> None:
+        """Both 'judge' and 'signals' expose a --model flag for judge routing."""
+        from gptme_sessions.cli import cli
+
+        for cmd_name in ("judge", "signals"):
+            params = [p for p in cli.commands[cmd_name].params if p.name == "judge_model"]
+            assert params, f"{cmd_name!r} is missing --model flag"
+            flag = params[0]
+            assert "--model" in flag.opts
 
     @pytest.mark.skipif(
         getattr(os, "getuid", lambda: -1)() == 0,
@@ -288,3 +716,104 @@ class TestJudgeCLI:
             assert "2026-03-07" in result.output or "abc123" in result.output
         finally:
             bad_entry.chmod(0o644)  # restore so tmp_path cleanup works
+
+    def test_judge_update_store_writes_alignment_grade(self, tmp_path: "Path") -> None:
+        """judge --update-store keeps legacy judge fields and grades.alignment in sync."""
+        from click.testing import CliRunner
+        from gptme_sessions.cli import cli
+        from gptme_sessions.store import SessionStore
+
+        journal_dir = tmp_path / "journal" / "2026-03-07"
+        journal_dir.mkdir(parents=True)
+        (journal_dir / "autonomous-session-abc123.md").write_text(
+            "## Session\nDid real work.\n",
+            encoding="utf-8",
+        )
+
+        sessions_dir = tmp_path / "sessions"
+        store = SessionStore(sessions_dir=sessions_dir)
+        store.append(SessionRecord(session_id="abc123", outcome="productive"))
+
+        runner = CliRunner()
+        with patch(
+            "gptme_sessions.judge.judge_session",
+            return_value={
+                "score": 0.81,
+                "reason": "Meaningful progress on the active task.",
+                "model": "claude-haiku-4-5",
+            },
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "--sessions-dir",
+                    str(sessions_dir),
+                    "judge",
+                    "--journal-dir",
+                    str(tmp_path / "journal"),
+                    "--update-store",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        record = SessionStore(sessions_dir=sessions_dir).load_all()[0]
+        assert record.llm_judge_score == 0.81
+        assert record.llm_judge_reason == "Meaningful progress on the active task."
+        assert record.llm_judge_model == "claude-haiku-4-5"
+        assert record.grades == {"alignment": 0.81}
+        assert record.grade_reasons == {"alignment": "Meaningful progress on the active task."}
+
+    def test_classify_update_store_writes_alignment_grade(self, tmp_path: "Path") -> None:
+        """classify --judge --update-store mirrors judge output into grades.alignment."""
+        from click.testing import CliRunner
+        from gptme_sessions.classification import ClassificationResult
+        from gptme_sessions.cli import cli
+        from gptme_sessions.store import SessionStore
+
+        journal_dir = tmp_path / "journal" / "2026-03-07"
+        journal_dir.mkdir(parents=True)
+        (journal_dir / "autonomous-session-def456.md").write_text(
+            "## Session\nFixed a real bug.\n",
+            encoding="utf-8",
+        )
+
+        sessions_dir = tmp_path / "sessions"
+        store = SessionStore(sessions_dir=sessions_dir)
+        store.append(SessionRecord(session_id="def456", outcome="productive"))
+
+        runner = CliRunner()
+        with patch(
+            "gptme_sessions.classification.judge_and_classify",
+            return_value=(
+                ClassificationResult(
+                    category="code",
+                    confidence=0.93,
+                    productive=True,
+                    classifier="llm",
+                ),
+                {
+                    "score": 0.77,
+                    "reason": "Good progress on core implementation.",
+                    "model": "claude-haiku-4-5",
+                },
+            ),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "--sessions-dir",
+                    str(sessions_dir),
+                    "classify",
+                    "--journal-dir",
+                    str(tmp_path / "journal"),
+                    "--judge",
+                    "--update-store",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        record = SessionStore(sessions_dir=sessions_dir).load_all()[0]
+        assert record.category == "code"
+        assert record.llm_judge_score == 0.77
+        assert record.grades == {"alignment": 0.77}
+        assert record.grade_reasons == {"alignment": "Good progress on core implementation."}

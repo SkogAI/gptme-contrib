@@ -242,19 +242,54 @@ def load_config() -> Dict[Any, Any]:
 
 def create_tweet_eval_prompt(tweet: Dict, config: Dict) -> str:
     """Create prompt for tweet evaluation"""
-    # Include thread context if available
+    twitter_handle = os.environ.get("TWITTER_HANDLE")
+    if not twitter_handle:
+        raise ValueError(
+            "TWITTER_HANDLE env var must be set (e.g. export TWITTER_HANDLE=MyBotHandle)"
+        )
+    handle_lower = twitter_handle.lower()
+
+    # Include thread context if available. Annotate our own prior messages so
+    # the LLM doesn't read the thread as "two other parties" and conclude the
+    # conversation is already resolved.
     thread_context = ""
+    in_thread = False
     if tweet.get("thread_context"):
         thread_context = "\nConversation Thread:\n"
         for i, t in enumerate(tweet["thread_context"]):
-            thread_context += f"Tweet {i + 1} - @{t['author']}: {t['text']}\n"
+            author = t["author"]
+            is_us = author.lower() == handle_lower
+            if is_us:
+                in_thread = True
+            marker = " (US — our prior message)" if is_us else ""
+            thread_context += f"Tweet {i + 1} - @{author}{marker}: {t['text']}\n"
+
+    # Direct mention detection: handle appears in the tweet body itself.
+    tweet_text = tweet.get("text", "")
+    is_direct_mention = f"@{handle_lower}" in tweet_text.lower()
+
+    # Build identity context. Fire for direct mentions OR when we're in the
+    # thread — both cases need explicit identity to prevent confusion.
+    mention_note = ""
+    if is_direct_mention or in_thread:
+        mention_note = (
+            f"\nIMPORTANT: @{twitter_handle} IS our account — we are @{twitter_handle}."
+        )
+        if is_direct_mention:
+            mention_note += " This tweet is addressed TO us. Evaluate it as relevant to us personally."
+        if in_thread:
+            mention_note += (
+                f" Any prior @{twitter_handle} messages in the thread are OUR own replies;"
+                " their presence does NOT mean the conversation is resolved."
+                " Evaluate whether the most recent message from another party needs our response."
+            )
 
     return f"""Evaluate this tweet for response suitability.
 
-Tweet: "{tweet["text"]}"
+Tweet: "{tweet_text}"
 Author: @{tweet["author"]}
 Context: {json.dumps(tweet.get("context", {}), indent=2)}
-{thread_context}
+{thread_context}{mention_note}
 
 Evaluation criteria:
 1. Relevance to our topics: {", ".join(config["evaluation"]["topics"])}
@@ -355,7 +390,11 @@ def get_system_prompt() -> Message:
 
     # Create Twitter-specific system prompt
     agent_name = os.environ.get("AGENT_NAME", "Agent")
-    twitter_handle = os.environ.get("TWITTER_HANDLE", "agent")
+    twitter_handle = os.environ.get("TWITTER_HANDLE")
+    if not twitter_handle:
+        raise ValueError(
+            "TWITTER_HANDLE env var must be set (e.g. export TWITTER_HANDLE=MyBotHandle)"
+        )
     twitter_prompt = f"""You are {agent_name} (@{twitter_handle}), an AI agent who evaluates and responds to tweets.
 Your task is to evaluate tweets and generate appropriate responses while:
 1. Maintaining your established personality (direct, opinionated, occasionally witty)
@@ -412,6 +451,19 @@ def parse_llm_response(content: str, response_type: Type[T], task: TaskType) -> 
         return response_type.default()
 
 
+def _resolve_openrouter_api_key() -> str:
+    """Prefer Twitter/social-specific OpenRouter keys over the shared default."""
+    for env_var in (
+        "OPENROUTER_API_KEY_TWITTER",
+        "OPENROUTER_API_KEY_SOCIAL",
+        "OPENROUTER_API_KEY",
+    ):
+        value = os.environ.get(env_var, "")
+        if value:
+            return value
+    return ""
+
+
 def _reply_with_max_tokens(messages: list[Message], model_name: str) -> Message:
     """Call LLM with explicit max_tokens to control OpenRouter budget reservation.
 
@@ -427,7 +479,7 @@ def _reply_with_max_tokens(messages: list[Message], model_name: str) -> Message:
     """
     import openai
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    api_key = _resolve_openrouter_api_key()
     if not api_key:
         # Not using OpenRouter — fall back to gptme's reply (no budget issue)
         return reply(messages, model_name, stream=False)

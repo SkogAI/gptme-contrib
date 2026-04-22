@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from gptme_sessions.discovery import (
     _quick_date_from_jsonl,
+    _quick_datetime_from_jsonl,
     _session_in_range,
     decode_cc_project_path,
     discover_cc_sessions,
@@ -20,6 +21,8 @@ from gptme_sessions.discovery import (
     extract_project,
     extract_session_name,
     parse_gptme_config,
+    resolve_cc_session_model,
+    session_datetime_from_path,
 )
 
 
@@ -94,6 +97,42 @@ def test_quick_date_from_jsonl_non_dict_lines(tmp_path: Path) -> None:
         + "\n"
     )
     assert _quick_date_from_jsonl(jsonl) == date(2026, 3, 5)
+
+
+# --- _quick_datetime_from_jsonl ---
+
+
+def test_quick_datetime_from_jsonl_returns_full_datetime(tmp_path: Path) -> None:
+    """Real start time is preserved — not collapsed to a date."""
+    jsonl = tmp_path / "session.jsonl"
+    jsonl.write_text(json.dumps({"type": "user", "timestamp": "2026-03-05T22:42:48Z"}) + "\n")
+    assert _quick_datetime_from_jsonl(jsonl) == datetime(
+        2026, 3, 5, 22, 42, 48, tzinfo=timezone.utc
+    )
+
+
+def test_quick_datetime_from_jsonl_missing(tmp_path: Path) -> None:
+    jsonl = tmp_path / "empty.jsonl"
+    jsonl.write_text("")
+    assert _quick_datetime_from_jsonl(jsonl) is None
+
+
+# --- session_datetime_from_path ---
+
+
+def test_session_datetime_from_path_claude_code(tmp_path: Path) -> None:
+    """Avoids the noon-UTC placeholder bug by returning the trajectory's real start time."""
+    jsonl = tmp_path / "abc12345-ffff.jsonl"
+    jsonl.write_text(json.dumps({"type": "system", "timestamp": "2026-04-15T22:42:48.123Z"}) + "\n")
+    dt = session_datetime_from_path("claude-code", jsonl)
+    assert dt is not None
+    assert dt.date() == date(2026, 4, 15)
+    assert (dt.hour, dt.minute, dt.second) == (22, 42, 48)
+
+
+def test_session_datetime_from_path_missing_file_returns_none(tmp_path: Path) -> None:
+    jsonl = tmp_path / "does-not-exist.jsonl"
+    assert session_datetime_from_path("claude-code", jsonl) is None
 
 
 # --- parse_gptme_config ---
@@ -173,6 +212,187 @@ def test_extract_cc_model_non_dict_lines(tmp_path: Path) -> None:
     assert extract_cc_model(jsonl_file) == "claude-opus-4-6"
 
 
+# --- resolve_cc_session_model ---
+
+
+def _write_stream_log(
+    tmp_dir: Path,
+    session_id: str,
+    log_path: Path,
+    first_line: dict | str,
+) -> None:
+    """Write a stream log and its pointer file for test setup."""
+    if isinstance(first_line, dict):
+        log_path.write_text(json.dumps(first_line) + "\n", encoding="utf-8")
+    else:
+        log_path.write_text(first_line, encoding="utf-8")
+    (tmp_dir / f"cc-session-log-ref-{session_id}.txt").write_text(
+        str(log_path) + "\n", encoding="utf-8"
+    )
+
+
+def test_resolve_cc_session_model_from_stream_log(tmp_path: Path) -> None:
+    """Resolve uses the stream log when the pointer file exists — covers
+    `claude -p --stream-json` autonomous sessions whose trajectory is a stub."""
+    sid = "abcd-1234"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    log_path = tmp_dir / "cc-session-deadbeef.log"
+    _write_stream_log(
+        tmp_dir,
+        sid,
+        log_path,
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": sid,
+            "model": "claude-sonnet-4-6",
+        },
+    )
+    assert resolve_cc_session_model(sid, tmp_dir=tmp_dir) == "claude-sonnet-4-6"
+
+
+def test_resolve_cc_session_model_stream_log_preferred_over_stub(tmp_path: Path) -> None:
+    """When both a stub trajectory (no assistant messages) and a stream log
+    exist, the stream log wins — the stub can't attribute."""
+    sid = "stub-and-log"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    log_path = tmp_dir / "cc-session-xyz.log"
+    _write_stream_log(
+        tmp_dir, sid, log_path, {"type": "system", "subtype": "init", "model": "claude-opus-4-6"}
+    )
+    # Stub trajectory — aiTitle only, no assistant message
+    (project_dir / f"{sid}.jsonl").write_text(
+        json.dumps({"aiTitle": "some title", "sessionId": sid, "type": "summary"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_cc_session_model(sid, project_dir=project_dir, tmp_dir=tmp_dir) == "claude-opus-4-6"
+    )
+
+
+def test_resolve_cc_session_model_falls_back_to_trajectory(tmp_path: Path) -> None:
+    """When no pointer/log exists (interactive session), fall back to the
+    trajectory file in the project dir."""
+    sid = "interactive-7890"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    (project_dir / f"{sid}.jsonl").write_text(
+        json.dumps({"message": {"role": "user", "content": "hi"}})
+        + "\n"
+        + json.dumps({"message": {"role": "assistant", "model": "claude-opus-4-7", "content": []}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_cc_session_model(sid, project_dir=project_dir, tmp_dir=tmp_dir) == "claude-opus-4-7"
+    )
+
+
+def test_resolve_cc_session_model_returns_none_when_nothing_resolves(tmp_path: Path) -> None:
+    """Neither a stream log nor a trajectory attributes — refuse to guess.
+    Guards the ErikBjare/bob#615 bandit-contamination invariant."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    assert resolve_cc_session_model("ghost-id", project_dir=project_dir, tmp_dir=tmp_dir) is None
+
+
+def test_resolve_cc_session_model_empty_session_id(tmp_path: Path) -> None:
+    """Empty session id short-circuits to None without touching the filesystem."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    assert resolve_cc_session_model("", tmp_dir=tmp_dir) is None
+
+
+def test_resolve_cc_session_model_dangling_pointer_falls_back(tmp_path: Path) -> None:
+    """Pointer file exists but references a non-existent log — fall back to
+    the trajectory rather than returning None."""
+    sid = "dangling-pointer"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    (tmp_dir / f"cc-session-log-ref-{sid}.txt").write_text(
+        "/tmp/does-not-exist.log\n", encoding="utf-8"
+    )
+    (project_dir / f"{sid}.jsonl").write_text(
+        json.dumps({"message": {"role": "assistant", "model": "claude-haiku-4-5", "content": []}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_cc_session_model(sid, project_dir=project_dir, tmp_dir=tmp_dir)
+        == "claude-haiku-4-5"
+    )
+
+
+def test_resolve_cc_session_model_stream_log_no_model_field(tmp_path: Path) -> None:
+    """Stream log's first line lacks a top-level model — fall back cleanly.
+    Covers the case where the log format drifts."""
+    sid = "no-model"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    log_path = tmp_dir / "cc-session-nomodel.log"
+    _write_stream_log(tmp_dir, sid, log_path, {"type": "system", "subtype": "init"})
+    (project_dir / f"{sid}.jsonl").write_text(
+        json.dumps({"message": {"role": "assistant", "model": "claude-sonnet-4-6", "content": []}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_cc_session_model(sid, project_dir=project_dir, tmp_dir=tmp_dir)
+        == "claude-sonnet-4-6"
+    )
+
+
+def test_resolve_cc_session_model_stream_log_garbage_first_line(tmp_path: Path) -> None:
+    """Stream log's first line is invalid JSON — return None from the log
+    probe and let the trajectory fallback kick in."""
+    sid = "garbage"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    log_path = tmp_dir / "cc-session-garbage.log"
+    _write_stream_log(tmp_dir, sid, log_path, "not-json-at-all\n")
+    (project_dir / f"{sid}.jsonl").write_text(
+        json.dumps({"message": {"role": "assistant", "model": "claude-opus-4-6", "content": []}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_cc_session_model(sid, project_dir=project_dir, tmp_dir=tmp_dir) == "claude-opus-4-6"
+    )
+
+
+def test_resolve_cc_session_model_without_project_dir(tmp_path: Path) -> None:
+    """When project_dir is None, only the stream log is consulted. A
+    missing pointer returns None instead of trying to read a trajectory."""
+    sid = "no-project-dir"
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    assert resolve_cc_session_model(sid, project_dir=None, tmp_dir=tmp_dir) is None
+
+
 # --- discover_gptme_sessions ---
 
 
@@ -220,6 +440,21 @@ def test_discover_gptme_sessions_nonexistent(tmp_path: Path) -> None:
     assert result == []
 
 
+def test_discover_gptme_sessions_excludes_evals(tmp_path: Path) -> None:
+    """Eval benchmark sessions (gptme-evals-*) are excluded from discovery."""
+    # Real session
+    (tmp_path / "2026-03-05-dancing-blue-fish").mkdir()
+    # Eval sessions — should be excluded
+    (tmp_path / "2026-03-05-gptme-evals-anthropic--claude-sonnet-4-6-tool-abc123").mkdir()
+    (
+        tmp_path / "2026-03-05-gptme-evals-openrouter--anthropic--claude-haiku-4-5-tool-def456"
+    ).mkdir()
+
+    result = discover_gptme_sessions(date(2026, 3, 5), date(2026, 3, 5), logs_dir=tmp_path)
+    assert len(result) == 1
+    assert result[0].name == "2026-03-05-dancing-blue-fish"
+
+
 # --- discover_cc_sessions ---
 
 
@@ -242,7 +477,7 @@ def test_discover_cc_sessions(tmp_path: Path) -> None:
     _make_cc_session(project, "session3", "2026-03-05T14:00:00Z")
     _make_cc_session(project, "session4", "2026-03-06T09:00:00Z")
 
-    result = discover_cc_sessions(date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path)
+    result = discover_cc_sessions(date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path, min_size=0)
     assert len(result) == 2
     names = [p.stem for p in result]
     assert "session2" in names
@@ -260,7 +495,7 @@ def test_discover_cc_sessions_multi_project(tmp_path: Path) -> None:
     _make_cc_session(proj_b, "s2", "2026-03-05T11:00:00Z")
     _make_cc_session(proj_b, "s3", "2026-03-04T11:00:00Z")  # out of range
 
-    result = discover_cc_sessions(date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path)
+    result = discover_cc_sessions(date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path, min_size=0)
     assert len(result) == 2
 
 
@@ -269,6 +504,47 @@ def test_discover_cc_sessions_nonexistent(tmp_path: Path) -> None:
         date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path / "nonexistent"
     )
     assert result == []
+
+
+def test_discover_cc_sessions_filters_stubs(tmp_path: Path) -> None:
+    """Stub sessions (<4KB) are excluded by default; real sessions are kept."""
+    from gptme_sessions.discovery import CC_MIN_SESSION_SIZE
+
+    project = tmp_path / "-home-bob-bob"
+    project.mkdir()
+
+    # Create a stub session (small file, <4KB) — should be filtered
+    stub = _make_cc_session(project, "stub-session", "2026-03-05T10:00:00Z")
+    assert stub.stat().st_size < CC_MIN_SESSION_SIZE  # sanity check
+
+    # Create a real session (padded above threshold)
+    real = project / "real-session.jsonl"
+    line = json.dumps(
+        {"type": "user", "timestamp": "2026-03-05T12:00:00Z", "message": {"content": "hi"}}
+    )
+    # Pad with enough assistant lines to exceed 4KB
+    padding_line = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-6",
+                "content": [{"type": "text", "text": "x" * 200}],
+            }
+        }
+    )
+    real.write_text((line + "\n") + (padding_line + "\n") * 20)
+    assert real.stat().st_size >= CC_MIN_SESSION_SIZE  # sanity check
+
+    # Default min_size: stub excluded, real included
+    result = discover_cc_sessions(date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path)
+    assert len(result) == 1
+    assert result[0].stem == "real-session"
+
+    # With min_size=0: both included
+    result_all = discover_cc_sessions(
+        date(2026, 3, 5), date(2026, 3, 5), cc_dir=tmp_path, min_size=0
+    )
+    assert len(result_all) == 2
 
 
 # --- discover_codex_sessions ---

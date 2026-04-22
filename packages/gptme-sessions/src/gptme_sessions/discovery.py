@@ -66,8 +66,8 @@ def _session_in_range(session_name: str, start: date, end: date) -> bool:
         return False
 
 
-def _quick_date_from_jsonl(jsonl_path: Path) -> date | None:
-    """Extract session date from the first timestamped line of a JSONL file.
+def _quick_datetime_from_jsonl(jsonl_path: Path) -> datetime | None:
+    """Extract session start datetime from the first timestamped line of a JSONL file.
 
     Reads only until the first valid timestamp is found (fast).
     """
@@ -86,13 +86,21 @@ def _quick_date_from_jsonl(jsonl_path: Path) -> date | None:
                 ts_str = entry.get("timestamp")
                 if ts_str:
                     try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        return ts.date()
+                        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     except (ValueError, TypeError):
                         continue
     except (OSError, UnicodeDecodeError) as e:
         logger.debug("Failed to read %s: %s", jsonl_path, e)
     return None
+
+
+def _quick_date_from_jsonl(jsonl_path: Path) -> date | None:
+    """Extract session date from the first timestamped line of a JSONL file.
+
+    Reads only until the first valid timestamp is found (fast).
+    """
+    dt = _quick_datetime_from_jsonl(jsonl_path)
+    return dt.date() if dt else None
 
 
 def decode_cc_project_path(encoded: str) -> str:
@@ -124,6 +132,14 @@ def extract_cc_model(jsonl_path: Path) -> str | None:
         {"message": {"role": "assistant", "model": "claude-opus-4-6", ...}, ...}
 
     Scans up to 50 lines to find an assistant message with a model field.
+
+    .. note::
+        This only reads the trajectory file. Claude Code sessions invoked
+        with ``claude -p --stream-json --session-id X`` (batch / autonomous
+        usage) write a stub trajectory with no assistant messages — the
+        actual model lives in the stream log. Use
+        :func:`resolve_cc_session_model` when you have a session id and
+        want to cover both pipelines.
     """
     try:
         with open(jsonl_path, encoding="utf-8") as f:
@@ -146,6 +162,99 @@ def extract_cc_model(jsonl_path: Path) -> str | None:
                         return str(model)
     except (OSError, UnicodeDecodeError) as e:
         logger.debug("Failed to read %s for model extraction: %s", jsonl_path, e)
+    return None
+
+
+def _model_from_cc_stream_log(log_path: Path) -> str | None:
+    """Extract model from a ``claude -p --stream-json`` log's init line.
+
+    Autonomous runs invoke ``claude -p --stream-json`` and tee the stream
+    to ``/tmp/cc-session-{hash}.log``. The first line is a
+    ``type=system, subtype=init`` JSON event with ``model`` at the top
+    level — that's the authoritative model for the entire run.
+
+    Returns ``None`` on any parse / IO failure.
+    """
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(obj, dict):
+                    return None
+                model = obj.get("model")
+                if isinstance(model, str) and model:
+                    return model
+                return None
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug("Failed to read %s for model extraction: %s", log_path, e)
+    return None
+
+
+def resolve_cc_session_model(
+    session_id: str,
+    project_dir: Path | None = None,
+    tmp_dir: Path | None = None,
+) -> str | None:
+    """Resolve the model actually used by a Claude Code session.
+
+    Claude Code has two session pipelines with different storage layouts:
+
+    1. **Batch / autonomous** (``claude -p --stream-json --session-id X``)
+       writes only a stub trajectory at ``{project_dir}/{id}.jsonl``
+       (``aiTitle`` / ``sessionId`` metadata, no assistant messages). The
+       actual stream is teed to ``/tmp/cc-session-{hash}.log``, and a
+       pointer file at ``/tmp/cc-session-log-ref-{id}.txt`` contains the
+       log path. The first line of the log is a ``type=system,
+       subtype=init`` event with ``model`` at the top level.
+
+    2. **Interactive** CC sessions write a full trajectory to
+       ``{project_dir}/{id}.jsonl`` with ``message.model`` on each
+       assistant line.
+
+    Preference order: stream log first (covers the batch / autonomous
+    pipeline, which is the dominant usage for bandit updates), falling
+    back to the trajectory (interactive).
+
+    Returns ``None`` when neither source attributes — callers should
+    refuse to guess rather than silently pick another session's model
+    (see the post-mortem in ErikBjare/bob#615 for the contamination
+    vector this guarantees against).
+
+    :param session_id: the ``CC_SESSION_ID`` / ``--session-id`` uuid.
+    :param project_dir: Claude Code project directory (``~/.claude/projects/<slug>``).
+        If ``None``, only the stream log is consulted.
+    :param tmp_dir: directory containing the ``cc-session-log-ref-*.txt``
+        pointer files. Defaults to ``/tmp``.
+    """
+    if not session_id:
+        return None
+
+    if tmp_dir is None:
+        tmp_dir = Path("/tmp")
+
+    ref = tmp_dir / f"cc-session-log-ref-{session_id}.txt"
+    if ref.is_file():
+        try:
+            log_path = Path(ref.read_text(encoding="utf-8").strip())
+        except (OSError, UnicodeDecodeError) as e:
+            logger.debug("Failed to read pointer %s: %s", ref, e)
+            log_path = None
+        if log_path and log_path.is_file():
+            model = _model_from_cc_stream_log(log_path)
+            if model:
+                return model
+
+    if project_dir is not None:
+        trajectory = project_dir / f"{session_id}.jsonl"
+        if trajectory.is_file():
+            return extract_cc_model(trajectory)
+
     return None
 
 
@@ -188,6 +297,9 @@ def discover_gptme_sessions(
     Scans ``~/.local/share/gptme/logs/`` (or ``GPTME_LOGS_DIR``) for
     directories whose name starts with an ISO date in ``[start, end]``.
 
+    Eval sessions (``gptme-evals-*``) are excluded — these are automated
+    benchmark runs that should not count as real agent work sessions.
+
     Returns sorted list of session directory paths.
     """
     if logs_dir is None:
@@ -201,6 +313,11 @@ def discover_gptme_sessions(
         for entry in sorted(logs_dir.iterdir()):
             if not entry.is_dir():
                 continue
+            # Skip eval benchmark sessions — they are not real work sessions
+            # and inflate NOOP counts when synced into session records.
+            name_after_date = entry.name[11:]  # strip YYYY-MM-DD- prefix
+            if name_after_date.startswith("gptme-evals-"):
+                continue
             if _session_in_range(entry.name, start, end):
                 sessions.append(entry)
     except PermissionError:
@@ -208,16 +325,28 @@ def discover_gptme_sessions(
     return sessions
 
 
+# Minimum file size for CC sessions to filter out stub sessions.
+# CC creates ~2.8KB metadata-only stubs for sessions that never got an
+# assistant response (e.g. cancelled before first reply, permission prompts
+# that were declined).  These contain only permission-mode, system prompts,
+# and user messages — no actual work.  Counting them inflates NOOP rates.
+CC_MIN_SESSION_SIZE = 4096  # bytes
+
+
 def discover_cc_sessions(
     start: date,
     end: date,
     cc_dir: Path | None = None,
+    min_size: int = CC_MIN_SESSION_SIZE,
 ) -> list[Path]:
     """Find Claude Code session JSONL files within a date range.
 
     Scans ``~/.claude/projects/`` (or ``CLAUDE_HOME/projects/``) for
     session ``.jsonl`` files. Uses quick first-line timestamp extraction
     for fast date filtering.
+
+    Files smaller than *min_size* bytes are skipped — these are typically
+    stub sessions that never received an assistant response.
 
     Returns sorted list of session JSONL file paths.
     """
@@ -233,6 +362,9 @@ def discover_cc_sessions(
             if not project_dir.is_dir():
                 continue
             for jsonl_file in sorted(project_dir.glob("*.jsonl")):
+                # Skip stub sessions (metadata-only, no assistant response)
+                if min_size > 0 and jsonl_file.stat().st_size < min_size:
+                    continue
                 session_date = _quick_date_from_jsonl(jsonl_file)
                 if session_date is None:
                     continue
@@ -317,6 +449,36 @@ def session_date_from_path(harness: str, path: Path) -> date | None:
     else:
         # claude-code, copilot: date is embedded in the JSONL file
         return _quick_date_from_jsonl(path)
+
+
+def session_datetime_from_path(harness: str, path: Path) -> datetime | None:
+    """Extract session start datetime from a discovered session path.
+
+    For **claude-code** and **copilot**, reads the first event timestamp from
+    the JSONL file, yielding a real datetime (not a placeholder).
+    For **gptme** and **codex**, the path structure only encodes a date, so this
+    returns ``None`` unless the session's JSONL can be located and read.
+
+    Callers that need a real start time (e.g. to avoid noon-UTC placeholder
+    timestamps when syncing into the store) should prefer this function over
+    ``session_date_from_path``.
+
+    Returns ``None`` if the datetime cannot be determined.
+    """
+    if harness == "gptme":
+        # path is either the session dir or a .jsonl inside it; try conversation.jsonl
+        jsonl = path if path.suffix == ".jsonl" else path / "conversation.jsonl"
+        if jsonl.is_file():
+            return _quick_datetime_from_jsonl(jsonl)
+        return None
+    elif harness == "codex":
+        # path is at …/YYYY/MM/DD/file.jsonl — read first timestamp if available
+        if path.is_file():
+            return _quick_datetime_from_jsonl(path)
+        return None
+    else:
+        # claude-code, copilot: start time is embedded in the JSONL file
+        return _quick_datetime_from_jsonl(path)
 
 
 def extract_session_name(harness: str, path: Path) -> str | None:

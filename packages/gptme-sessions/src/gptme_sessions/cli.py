@@ -29,6 +29,7 @@ from .discovery import (
     extract_session_name,
     parse_gptme_config,
     session_date_from_path,
+    session_datetime_from_path,
 )
 from .post_session import VALID_AB_GROUPS, VALID_CONTEXT_TIERS, post_session
 from .record import SessionRecord, normalize_run_type
@@ -43,6 +44,26 @@ from .store import (
 logger = logging.getLogger(__name__)
 
 HARNESS_CHOICES = ["gptme", "claude-code", "codex", "copilot"]
+
+
+def _judge_fields(
+    score: float | None,
+    reason: str | None,
+    model: str | None,
+) -> dict[str, object]:
+    """Return legacy and multivariate-alignment fields for CLI results."""
+    if score is None:
+        return {}
+
+    fields: dict[str, object] = {
+        "llm_judge_score": score,
+        "llm_judge_reason": reason,
+        "llm_judge_model": model,
+        "grades": {"alignment": score},
+    }
+    if reason is not None:
+        fields["grade_reasons"] = {"alignment": reason}
+    return fields
 
 
 def _discover_all(
@@ -140,7 +161,9 @@ def _count_unsynced(
         return 0
     if records is None:
         records = store.load_all()
-    existing_paths = {r.journal_path for r in records if r.journal_path}
+    existing_paths = {r.journal_path for r in records if r.journal_path} | {
+        r.trajectory_path for r in records if r.trajectory_path
+    }
     return sum(1 for e in discovered if str(e["path"]) not in existing_paths)
 
 
@@ -174,7 +197,10 @@ def _show_discovery_fallback(since_days: int = 30) -> None:
 
 
 def _parse_since(since: str | None) -> int | None:
-    """Parse a --since value like '7d', '30', or 'all' into days (None = no filter)."""
+    """Parse a --since value like '7d', '1h', '30', or 'all' into days (None = no filter).
+
+    Hours are converted to days (minimum 1 day for store queries).
+    """
     if not since:
         return None
     if since.lower() == "all":
@@ -182,10 +208,14 @@ def _parse_since(since: str | None) -> int | None:
     try:
         if since.endswith("d"):
             return int(since[:-1])
+        if since.endswith("h"):
+            import math
+
+            return max(1, math.ceil(int(since[:-1]) / 24))
         return int(since)
     except ValueError:
         raise click.BadParameter(
-            f"invalid value {since!r} (expected e.g. 7d, 30d, or 'all')",
+            f"invalid value {since!r} (expected e.g. 1h, 7d, 30d, or 'all')",
             param_hint="'--since'",
         )
 
@@ -199,7 +229,7 @@ def _parse_since(since: str | None) -> int | None:
 )
 @click.pass_context
 def cli(ctx: click.Context, sessions_dir: Path | None) -> None:
-    """Session tracking and analytics for gptme agents."""
+    """Session tracking and analytics for agents. Supports trajectories from gptme, Claude Code, Codex, and Copilot."""
     ctx.ensure_object(dict)
     ctx.obj["sessions_dir"] = sessions_dir
     if ctx.invoked_subcommand is None:
@@ -441,6 +471,7 @@ def stats(
         project=project,
     )
     s = store.stats(records)
+    showed_fallback = False
     if as_json:
         click.echo(json.dumps(s, indent=2))
     elif s.get("total", 0) == 0:
@@ -454,10 +485,22 @@ def stats(
             )
         else:
             _show_discovery_fallback(since_days=30)
+            showed_fallback = True
     else:
         if not since:
             click.echo(f"Last {since_days} days (use --since all for all-time):\n")
         format_stats(s)
+    if not as_json and not showed_fallback:
+        # Check for unsynced sessions regardless of whether stats matched anything —
+        # hint is useful even when results exist (import may add more context).
+        # Skip when _show_discovery_fallback already printed a sync recommendation.
+        hint_window = since_days if since_days else 30
+        unsynced = _count_unsynced(store, since_days=hint_window)
+        if unsynced > 0:
+            click.echo(
+                f"\nHint: {unsynced} session(s) discovered but not synced. "
+                "Run 'gptme-sessions sync' to import."
+            )
 
 
 # -- runs --------------------------------------------------------------------
@@ -900,10 +943,20 @@ def discover(
 @click.option("--grade", is_flag=True, help="Output grade only (float 0.0-1.0)")
 @click.option("--usage", is_flag=True, help="Output token usage breakdown")
 @click.option(
-    "--llm-judge", is_flag=True, help="Run LLM-as-judge scoring (requires anthropic package)"
+    "--llm-judge",
+    is_flag=True,
+    help="Run LLM-as-judge scoring (requires anthropic or gptme package)",
 )
 @click.option("--goals", default=None, help="Agent goals for LLM judge (default: generic)")
 @click.option("--category", "judge_category", default=None, help="Category hint for LLM judge")
+@click.option(
+    "--model",
+    "judge_model",
+    default=None,
+    help="Judge model ID. Anthropic IDs (claude-*, anthropic/*) use the anthropic SDK; "
+    "other provider-prefixed IDs (openrouter/..., openai-subscription/..., lmstudio/...) "
+    "route via gptme.llm.reply.",
+)
 def signals(
     path: Path,
     as_json: bool,
@@ -912,6 +965,7 @@ def signals(
     llm_judge: bool,
     goals: str | None,
     judge_category: str | None,
+    judge_model: str | None,
 ) -> None:
     """Extract productivity signals from a gptme or Claude Code trajectory (.jsonl)."""
     # Validate mutual exclusivity
@@ -940,6 +994,8 @@ def signals(
         judge_kwargs: dict = {}
         if goals:
             judge_kwargs["goals"] = goals
+        if judge_model:
+            judge_kwargs["model"] = judge_model
         verdict = judge_from_signals(
             result,
             category=judge_category,
@@ -948,7 +1004,10 @@ def signals(
         if verdict:
             result["llm_judge"] = verdict
         else:
-            click.echo("LLM judge: unavailable (missing API key or anthropic package)", err=True)
+            click.echo(
+                "LLM judge: unavailable (missing API key, SDK, or judge returned no result)",
+                err=True,
+            )
 
     if grade:
         click.echo(f"{result['grade']:.4f}")
@@ -1166,16 +1225,34 @@ def sync(
             if not rec.trajectory_path:
                 continue
             h = rec.harness or "unknown"
-            sd = session_date_from_path(h, Path(rec.trajectory_path))
-            if sd is None:
-                continue
-            correct_ts = f"{sd.isoformat()}T00:00:00+00:00"
-            # Only fix if the existing timestamp doesn't match the session date
-            if not rec.timestamp.startswith(sd.isoformat()):
+            traj = Path(rec.trajectory_path)
+            # Prefer the real start time from the trajectory; fall back to
+            # session_date at midnight when the trajectory can't be read.
+            real_dt = session_datetime_from_path(h, traj) if traj.is_file() else None
+            if real_dt:
+                correct_ts = real_dt.isoformat()
+                new_prefix = real_dt.date().isoformat()
+            else:
+                sd = session_date_from_path(h, traj)
+                if sd is None:
+                    continue
+                correct_ts = f"{sd.isoformat()}T00:00:00+00:00"
+                new_prefix = sd.isoformat()
+
+            # Detect noon-UTC placeholder: synthetic 12:00:00 timestamps
+            # produced by the old sync path. We include records whose duration
+            # was later backfilled by --with-signals — those still have the
+            # wrong time even though duration_seconds is now non-zero.
+            is_noon_placeholder = (
+                real_dt is not None
+                and rec.timestamp[11:19] == "12:00:00"
+                and real_dt.isoformat()[11:19] != "12:00:00"
+            )
+            needs_fix = not rec.timestamp.startswith(new_prefix) or is_noon_placeholder
+            if needs_fix:
                 if dry_run:
                     click.echo(
-                        f"  would fix: {rec.session_id}  "
-                        f"{rec.timestamp[:10]} → {sd.isoformat()}"
+                        f"  would fix: {rec.session_id}  {rec.timestamp[:19]} → {correct_ts[:19]}"
                     )
                 else:
                     rec.timestamp = correct_ts
@@ -1277,15 +1354,24 @@ def sync(
                     updated += 1
             continue
 
-        # Build the record with correct timestamp from session_date (not now()).
-        # Without this, all bulk-synced records get today's timestamp and
-        # skew daily stats (e.g. 7102 records appearing as "today").
+        # Build the record with correct timestamp from the trajectory's first
+        # event (not now()).  Without this, all bulk-synced records either get
+        # today's timestamp (skewing daily stats) or a noon-UTC placeholder
+        # (which collapses many sessions to a single hour and breaks hourly
+        # analytics).  Read the real first-event datetime when possible;
+        # fall back to noon-UTC on the session_date only if the trajectory
+        # has no readable timestamp.
+        session_dt: datetime | None = (
+            session_datetime_from_path(entry["harness"], traj_path) if traj_path.is_file() else None
+        )
         session_date: date | None = entry.get("session_date")
         record_kwargs: dict = {
             "harness": entry["harness"],
             "trajectory_path": path_str,  # used for deduplication on re-sync
         }
-        if session_date:
+        if session_dt:
+            record_kwargs["timestamp"] = session_dt.isoformat()
+        elif session_date:
             record_kwargs["timestamp"] = datetime(
                 session_date.year,
                 session_date.month,
@@ -1347,6 +1433,48 @@ def sync(
             parts.append(f"updated {updated}")
         parts.append(f"{skipped} unchanged.")
         click.echo(", ".join(parts))
+
+
+@cli.command("repair-grades")
+@click.option("--dry-run", is_flag=True, help="Show what would change without rewriting the store")
+@click.pass_context
+def repair_grades(ctx: click.Context, dry_run: bool) -> None:
+    """Backfill multivariate grade fields from legacy scalar fields."""
+    store = SessionStore(sessions_dir=ctx.obj["sessions_dir"])
+    records = store.load_all()
+    if not records:
+        click.echo("No records in store.")
+        return
+
+    repaired = 0
+    productivity_added = 0
+    alignment_added = 0
+    reasons_added = 0
+
+    for rec in records:
+        had_productivity = "productivity" in rec.grades
+        had_alignment = "alignment" in rec.grades
+        had_alignment_reason = "alignment" in rec.grade_reasons
+
+        if rec.sync_grade_fields():
+            repaired += 1
+            if not had_productivity and "productivity" in rec.grades:
+                productivity_added += 1
+            if not had_alignment and "alignment" in rec.grades:
+                alignment_added += 1
+            if not had_alignment_reason and "alignment" in rec.grade_reasons:
+                reasons_added += 1
+
+    if repaired and not dry_run:
+        store.rewrite(records)
+
+    verb = "Would repair" if dry_run else "Repaired"
+    click.echo(
+        f"{verb} {repaired} record(s): "
+        f"productivity={productivity_added}, "
+        f"alignment={alignment_added}, "
+        f"alignment_reasons={reasons_added}."
+    )
 
 
 # -- post-session ------------------------------------------------------------
@@ -1476,6 +1604,14 @@ def post_session_cmd(
 @click.option("--last", type=int, default=20, help="Score last N sessions (default: 20)")
 @click.option("--goals", default=None, help="Agent goals for LLM judge (default: generic)")
 @click.option(
+    "--model",
+    "judge_model",
+    default=None,
+    help="Judge model ID. Anthropic IDs (claude-*, anthropic/*) use the anthropic SDK; "
+    "other provider-prefixed IDs (openrouter/..., openai-subscription/..., lmstudio/...) "
+    "route via gptme.llm.reply. Default: claude-haiku-4-5-20251001.",
+)
+@click.option(
     "--update-store",
     is_flag=True,
     help="Write scores back to session-records.jsonl (matching by session_id)",
@@ -1488,6 +1624,7 @@ def judge(
     journal_dir: Path | None,
     last: int,
     goals: str | None,
+    judge_model: str | None,
     update_store: bool,
     as_json: bool,
     dry_run: bool,
@@ -1500,10 +1637,12 @@ def judge(
     With --update-store, writes scores back to session-records.jsonl by matching
     session IDs from journal filenames to stored records.
     """
-    from .judge import DEFAULT_GOALS, judge_session
+    from .judge import DEFAULT_GOALS, DEFAULT_JUDGE_MODEL, judge_session
 
     if dry_run and update_store:
         raise click.UsageError("--dry-run and --update-store are mutually exclusive")
+
+    effective_model = judge_model or DEFAULT_JUDGE_MODEL
 
     if journal_dir is None:
         journal_dir = Path.cwd() / "journal"
@@ -1573,13 +1712,13 @@ def judge(
                     click.echo(f"  {sid:<12} {entry_date}  {cat:<14} {outcome}")
                 continue
 
-            verdict = judge_session(text, category=cat, goals=effective_goals)
+            verdict = judge_session(
+                text, category=cat, goals=effective_goals, model=effective_model
+            )
             score = verdict["score"] if verdict else None
             reason = verdict["reason"] if verdict else None
 
-            result_row["llm_judge_score"] = score
-            result_row["llm_judge_reason"] = reason
-            result_row["llm_judge_model"] = verdict["model"] if verdict else None
+            result_row.update(_judge_fields(score, reason, verdict["model"] if verdict else None))
             results.append(result_row)
 
             if not as_json and score is not None:
@@ -1599,14 +1738,16 @@ def judge(
     if update_store:
         store = SessionStore(sessions_dir=ctx.obj["sessions_dir"])
         records = store.load_all()
-        score_map = {r["session_id"]: r for r in results if r["llm_judge_score"] is not None}
+        score_map = {r["session_id"]: r for r in results if r.get("llm_judge_score") is not None}
         updated = 0
         for rec in records:
             if rec.session_id in score_map:
                 s = score_map[rec.session_id]
-                rec.llm_judge_score = s["llm_judge_score"]
-                rec.llm_judge_reason = s["llm_judge_reason"]
-                rec.llm_judge_model = s["llm_judge_model"]
+                rec.set_alignment_grade(
+                    s["llm_judge_score"],
+                    reason=s.get("llm_judge_reason"),
+                    model=s.get("llm_judge_model"),
+                )
                 updated += 1
         if updated:
             store.rewrite(records)
@@ -1623,7 +1764,7 @@ def judge(
         click.echo(json.dumps(results, indent=2))
     else:
         # Summary stats
-        scored = [r for r in results if r["llm_judge_score"] is not None]
+        scored = [r for r in results if r.get("llm_judge_score") is not None]
         if scored:
             scores = [r["llm_judge_score"] for r in scored]
             click.echo(
@@ -1751,9 +1892,13 @@ def classify(
                 "journal_path": str(entry),
             }
             if judge_result:
-                row["llm_judge_score"] = judge_result["score"]
-                row["llm_judge_reason"] = judge_result["reason"]
-                row["llm_judge_model"] = judge_result["model"]
+                row.update(
+                    _judge_fields(
+                        judge_result["score"],
+                        judge_result["reason"],
+                        judge_result["model"],
+                    )
+                )
 
             results.append(row)
 
@@ -1779,9 +1924,11 @@ def classify(
                 r = cat_map[rec.session_id]
                 rec.category = r["category"]
                 if r.get("llm_judge_score") is not None:
-                    rec.llm_judge_score = r["llm_judge_score"]
-                    rec.llm_judge_reason = r["llm_judge_reason"]
-                    rec.llm_judge_model = r["llm_judge_model"]
+                    rec.set_alignment_grade(
+                        r["llm_judge_score"],
+                        reason=r.get("llm_judge_reason"),
+                        model=r.get("llm_judge_model"),
+                    )
                 updated += 1
         if updated:
             store.rewrite(records)

@@ -1,12 +1,16 @@
 """LLM-as-judge for session goal-alignment scoring.
 
-Evaluates agent sessions for strategic value using a cheap LLM (Haiku).
+Evaluates agent sessions for strategic value using an LLM.
 Returns a score (0.0-1.0) and a 1-sentence reason.
 
 The judge is designed to be:
 - **Generic**: Works for any agent, not just Bob. Goals are passed as a parameter.
-- **Cheap**: Uses Haiku (~$0.001/eval) so it can run on every session.
-- **Optional**: Requires ``anthropic`` package. Returns None on failure.
+- **Cheap**: Uses Haiku by default (~$0.001/eval).
+- **Pluggable**: ``--model`` supports direct Anthropic IDs *and* any provider
+  gptme can route to (``openrouter/...``, ``openai-subscription/...``,
+  ``lmstudio/...``, ``anthropic/...``, etc.) when the ``gptme`` package is
+  installed.
+- **Optional**: Returns None on failure (missing API key, import error).
 
 Integration points:
 - ``gptme-sessions signals --llm-judge``: score a single trajectory
@@ -16,15 +20,43 @@ Integration points:
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, TypedDict
+
+from .store import SessionStore
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001"
+CONFIG_PATHS = (
+    Path.home() / ".config" / "gptme" / "config.toml",
+    Path.home() / ".config" / "gptme" / "config.local.toml",
+)
+CONTEXT_FALLBACKS = {
+    "JUDGE": ("JUDGE", "LLM_JUDGE", "EVAL"),
+    "LLM_JUDGE": ("LLM_JUDGE", "JUDGE", "EVAL"),
+    "EVAL": ("EVAL", "JUDGE", "LLM_JUDGE"),
+}
+
+
+class JudgeMetadata(TypedDict):
+    backend: str
+    judge_version: str
+
+
+class JudgeVerdict(TypedDict, total=False):
+    score: float
+    reason: str
+    model: str
+    meta: JudgeMetadata
+
 
 JUDGE_SYSTEM = """\
 You are evaluating an AI agent's work session for strategic value.
@@ -61,24 +93,299 @@ The agent is a general-purpose autonomous AI assistant.
 2. Write high-quality code and documentation
 3. Self-improve through lessons and patterns
 4. Contribute to open-source projects"""
+NO_THINK_PREFILL = "<think></think>\n"
+NO_THINK_PREFILL_MODELS = frozenset({"lmstudio/qwen/qwen3.6-35b-a3b"})
 
 
-def _get_api_key() -> str:
+def _compute_judge_version() -> str:
+    payload = "\n---\n".join(
+        [
+            JUDGE_SYSTEM.strip(),
+            JUDGE_PROMPT_TEMPLATE.strip(),
+        ]
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    return f"goal-alignment-v1-{digest}"
+
+
+JUDGE_VERSION = _compute_judge_version()
+
+
+def _get_api_key(config_paths: tuple[Path, ...] = CONFIG_PATHS) -> str:
     """Resolve Anthropic API key from environment or gptme config."""
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key:
         return key
-    # Try gptme config as fallback
+    # Try gptme config as fallback (reads both config.toml and config.local.toml)
+    return _load_config_env(config_paths).get("ANTHROPIC_API_KEY", "")
+
+
+def _normalize_context(context: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", context.strip().upper()).strip("_")
+
+
+def _candidate_openrouter_env_var_names(context: str) -> list[str]:
+    normalized = _normalize_context(context)
+    names: list[str] = []
+    for candidate in CONTEXT_FALLBACKS.get(normalized, ((normalized,) if normalized else ())):
+        env_var = f"OPENROUTER_API_KEY_{candidate}"
+        if env_var not in names:
+            names.append(env_var)
+    names.append("OPENROUTER_API_KEY")
+    return names
+
+
+def _load_config_env(config_paths: tuple[Path, ...] = CONFIG_PATHS) -> dict[str, str]:
+    """Load merged [env] values from gptme config, with local overrides last."""
+    merged: dict[str, str] = {}
     try:
         import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ImportError:
+            return merged
 
-        config_path = Path.home() / ".config" / "gptme" / "config.toml"
-        if config_path.exists():
-            config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-            key = config.get("env", {}).get("ANTHROPIC_API_KEY", "")
-    except Exception:
-        pass
-    return key
+    for path in config_paths:
+        if not path.exists():
+            continue
+        try:
+            with path.open("rb") as fh:
+                data = tomllib.load(fh)
+        except Exception:
+            continue
+        env = data.get("env", {})
+        for key, value in env.items():
+            if isinstance(value, str):
+                merged[key] = value
+    return merged
+
+
+def _resolve_openrouter_api_key(
+    context: str,
+    *,
+    environ: dict[str, str] | None = None,
+    config_paths: tuple[Path, ...] = CONFIG_PATHS,
+) -> str | None:
+    """Resolve a scoped OpenRouter key, falling back to the shared default."""
+    env = os.environ if environ is None else environ
+    candidates = _candidate_openrouter_env_var_names(context)
+
+    for name in candidates:
+        value = env.get(name, "")
+        if value:
+            return value
+
+    config_env = _load_config_env(config_paths)
+    for name in candidates:
+        value = config_env.get(name, "")
+        if value:
+            return value
+
+    return None
+
+
+@contextlib.contextmanager
+def _judge_openrouter_env(model: str) -> Iterator[None]:
+    """Temporarily promote the judge-scoped OpenRouter key for judge calls."""
+    if not model.startswith("openrouter/"):
+        yield
+        return
+    judge_key = _resolve_openrouter_api_key("JUDGE")
+    if not judge_key:
+        yield
+        return
+    backup = os.environ.get("OPENROUTER_API_KEY")
+    if backup == judge_key:
+        yield
+        return
+    os.environ["OPENROUTER_API_KEY"] = judge_key
+    try:
+        yield
+    finally:
+        if backup is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = backup
+
+
+def _is_anthropic_direct_model(model: str) -> bool:
+    """True if the model ID should route via the direct Anthropic SDK.
+
+    Accepts bare Anthropic IDs (``claude-haiku-4-5-...``) and the
+    ``anthropic/<model>`` prefix. Anything else (``openrouter/...``,
+    ``openai-subscription/...``, ``lmstudio/...``, ``openai/...``, etc.)
+    routes through ``gptme.llm`` when available.
+    """
+    if model.startswith("anthropic/"):
+        return True
+    # Bare model IDs without a provider prefix: treat as Anthropic-direct iff
+    # they look like Anthropic IDs (keeps backcompat with the legacy default).
+    if "/" not in model and model.startswith("claude-"):
+        return True
+    return False
+
+
+def _strip_anthropic_prefix(model: str) -> str:
+    return model.removeprefix("anthropic/") if model.startswith("anthropic/") else model
+
+
+def _judge_backend(model: str) -> str:
+    if _is_anthropic_direct_model(model):
+        return "anthropic-direct"
+    return "gptme-fallback"
+
+
+def _build_judge_meta(*, model: str) -> JudgeMetadata:
+    return {
+        "backend": _judge_backend(model),
+        "judge_version": JUDGE_VERSION,
+    }
+
+
+def normalize_judge_verdict(payload: dict[str, Any]) -> JudgeVerdict:
+    """Attach stable metadata to a raw judge verdict."""
+    model = str(payload.get("model", ""))
+    raw_meta = payload.get("meta")
+    meta = raw_meta if isinstance(raw_meta, dict) else {}
+    base_meta = _build_judge_meta(model=model)
+    return {
+        "score": max(0.0, min(1.0, float(payload.get("score", 0.5)))),
+        "reason": str(payload.get("reason", "")),
+        "model": model,
+        "meta": {
+            "backend": str(meta.get("backend", base_meta["backend"])),
+            "judge_version": str(meta.get("judge_version", base_meta["judge_version"])),
+        },
+    }
+
+
+def _strip_json_wrappers(text: str) -> str:
+    """Normalize common LLM wrappers around a JSON payload."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+
+    if "```" in cleaned:
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(1).strip()
+
+    if cleaned.startswith("json"):
+        cleaned = cleaned[4:].strip()
+
+    return cleaned
+
+
+def _parse_judge_payload(text: str, model: str) -> dict | None:
+    """Parse a judge JSON response, tolerating markdown code fences."""
+    if not text:
+        return None
+    payload = _strip_json_wrappers(text)
+    try:
+        verdict = json.loads(payload)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", payload)
+        if not match:
+            logger.warning("LLM judge returned non-JSON response")
+            return None
+        verdict = json.loads(match.group(0))
+    score = float(verdict.get("score", 0.5))
+    reason = str(verdict.get("reason", ""))
+    score = max(0.0, min(1.0, score))
+    return {"score": score, "reason": reason, "model": model}
+
+
+def _prepare_messages_for_model(messages: list[Any], model: str) -> list[Any]:
+    """Apply known model-specific message tweaks before a gptme judge call."""
+    prepared = list(messages)
+    if model not in NO_THINK_PREFILL_MODELS:
+        return prepared
+    if (
+        prepared
+        and getattr(prepared[-1], "role", None) == "assistant"
+        and getattr(prepared[-1], "content", None) == NO_THINK_PREFILL
+    ):
+        return prepared
+
+    from gptme.message import Message
+
+    prepared.append(Message("assistant", NO_THINK_PREFILL))
+    return prepared
+
+
+def _judge_via_anthropic_direct(
+    prompt: str,
+    *,
+    model: str,
+    api_key: str | None,
+) -> dict | None:
+    """Call the judge via the direct Anthropic SDK (legacy path)."""
+    try:
+        import anthropic
+    except ImportError:
+        logger.warning("anthropic package not installed; direct judge unavailable")
+        return None
+
+    key = api_key or _get_api_key()
+    if not key:
+        logger.warning("No Anthropic API key found; direct judge unavailable")
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        response = client.messages.create(
+            model=_strip_anthropic_prefix(model),
+            max_tokens=150,
+            system=JUDGE_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = getattr(response.content[0], "text", "").strip()
+    except Exception as exc:
+        logger.warning("LLM judge (anthropic) failed: %s", exc)
+        return None
+
+    return _parse_judge_payload(text, model)
+
+
+def _judge_via_gptme(prompt: str, *, model: str) -> dict | None:
+    """Call the judge via ``gptme.llm.reply`` for non-Anthropic-direct models."""
+    try:
+        from gptme.init import init as init_gptme
+        from gptme.llm import reply
+        from gptme.message import Message
+    except ImportError:
+        logger.warning(
+            "gptme package not installed; model %r needs gptme.llm routing "
+            "(install gptme, or use an Anthropic-direct model ID)",
+            model,
+        )
+        return None
+
+    try:
+        with _judge_openrouter_env(model):
+            init_gptme(
+                model=model,
+                interactive=False,
+                tool_allowlist=[],
+                tool_format="markdown",
+            )
+            response = reply(
+                _prepare_messages_for_model(
+                    [
+                        Message("system", JUDGE_SYSTEM),
+                        Message("user", prompt),
+                    ],
+                    model,
+                ),
+                model,
+                stream=False,
+            )
+    except Exception as exc:
+        logger.warning("LLM judge (gptme) failed: %s", exc)
+        return None
+
+    text = getattr(response, "content", "")
+    return _parse_judge_payload(text, model)
 
 
 def judge_session(
@@ -95,24 +402,20 @@ def judge_session(
         journal_text: The session journal/summary text to evaluate.
         category: Work category (e.g. "code", "triage", "content").
         goals: Agent goals description (ordered by priority).
-        model: Anthropic model ID for the judge.
-        api_key: Anthropic API key. Falls back to env/config if not provided.
+        model: Model ID for the judge. Anthropic-direct IDs
+            (``claude-*``, ``anthropic/*``) use the ``anthropic`` SDK.
+            Other provider-prefixed IDs (``openrouter/...``,
+            ``openai-subscription/...``, ``lmstudio/...``, etc.) route
+            through ``gptme.llm.reply`` when the ``gptme`` package is
+            installed.
+        api_key: Anthropic API key (Anthropic-direct path only). Falls
+            back to env/config if not provided.
 
     Returns:
         Dict with keys ``score`` (float), ``reason`` (str), ``model`` (str),
-        or ``None`` if the evaluation fails (missing API key, import error, etc.).
+        or ``None`` if the evaluation fails (missing API key, import error,
+        non-JSON response, etc.).
     """
-    try:
-        import anthropic
-    except ImportError:
-        logger.warning("anthropic package not installed; LLM judge unavailable")
-        return None
-
-    key = api_key or _get_api_key()
-    if not key:
-        logger.warning("No Anthropic API key found; LLM judge unavailable")
-        return None
-
     # Truncate journal to ~4000 chars to keep costs low
     truncated = journal_text[:4000] if journal_text else "(empty session)"
 
@@ -125,35 +428,51 @@ def judge_session(
         journal=truncated,
     )
 
-    try:
-        client = anthropic.Anthropic(api_key=key)
-        response = client.messages.create(
+    if _is_anthropic_direct_model(model):
+        return _judge_via_anthropic_direct(prompt, model=model, api_key=api_key)
+    return _judge_via_gptme(prompt, model=model)
+
+
+def judge_session_with_fallback(
+    journal_text: str,
+    category: str | None = None,
+    *,
+    goals: str = DEFAULT_GOALS,
+    default_model: str = DEFAULT_JUDGE_MODEL,
+    fallback_models: tuple[str, ...] = (),
+    api_key: str | None = None,
+) -> dict | None:
+    """Score a session, trying fallback models if the primary is unavailable.
+
+    Args:
+        journal_text: The session journal/summary text to evaluate.
+        category: Work category (e.g. "code", "triage", "content").
+        goals: Agent goals description (ordered by priority).
+        default_model: Primary judge model. Tried first.
+        fallback_models: Additional models to try in order when the primary fails.
+        api_key: Anthropic API key (Anthropic-direct path only).
+
+    Returns:
+        Dict with keys ``score``, ``reason``, ``model`` or ``None`` if all models fail.
+    """
+    models_to_try = (default_model, *fallback_models)
+    for i, model in enumerate(models_to_try):
+        if i > 0:
+            logger.info(
+                "Judge model %s unavailable; falling back to %s",
+                models_to_try[i - 1],
+                model,
+            )
+        result = judge_session(
+            journal_text,
+            category=category,
+            goals=goals,
             model=model,
-            max_tokens=150,
-            system=JUDGE_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
+            api_key=api_key,
         )
-        text = getattr(response.content[0], "text", "").strip()
-
-        # Handle markdown code block wrapping — use regex to avoid splitting on
-        # backticks that appear inside the reason string
-        if "```" in text:
-            m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            if m:
-                text = m.group(1).strip()
-
-        verdict = json.loads(text)
-        score = float(verdict.get("score", 0.5))
-        reason = str(verdict.get("reason", ""))
-
-        # Clamp to valid range
-        score = max(0.0, min(1.0, score))
-
-        return {"score": score, "reason": reason, "model": model}
-
-    except Exception as e:
-        logger.warning("LLM judge failed: %s", e)
-        return None
+        if result is not None:
+            return result
+    return None
 
 
 def judge_from_signals(
@@ -204,3 +523,104 @@ def judge_from_signals(
         journal_text = "\n".join(parts) if parts else "(no signal data)"
 
     return judge_session(journal_text, category=category, **kwargs)
+
+
+def _store_judge_meta(record: Any, meta: JudgeMetadata | None) -> None:
+    """Persist judge metadata via the SessionRecord legacy-field bridge."""
+    if not meta:
+        return
+    normalized = {k: str(v) for k, v in meta.items() if v}
+    if not normalized:
+        return
+    legacy_fields = getattr(record, "_legacy_fields", None)
+    if isinstance(legacy_fields, dict):
+        legacy_fields["llm_judge_meta"] = normalized
+
+
+def write_alignment_grade(
+    *,
+    session_id: str,
+    verdict: JudgeVerdict,
+    sessions_dir: Path,
+) -> bool:
+    """Persist an alignment verdict onto an existing session record.
+
+    Also opportunistically populates ``span_aggregates`` from the session's
+    trajectory when one is available. This is the natural integration point:
+    the record is already being loaded and rewritten, so the extra work is
+    amortized and keeps per-tool-call span data flowing into the LOO /
+    analytics pipelines that key off ``SessionRecord``.
+    """
+    store = SessionStore(sessions_dir=sessions_dir)
+    records = store.load_all()
+    normalized = normalize_judge_verdict(dict(verdict))
+    for record in records:
+        if record.session_id != session_id:
+            continue
+        record.set_alignment_grade(
+            normalized["score"],
+            reason=normalized["reason"],
+            model=normalized["model"],
+        )
+        _store_judge_meta(record, normalized.get("meta"))
+        # Safe to run unconditionally: returns False when trajectory_path is
+        # missing / unreadable or harness is unknown, and is idempotent when
+        # re-run after new trajectory data arrives.
+        try:
+            record.populate_span_aggregates()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "populate_span_aggregates failed for %s: %s",
+                session_id,
+                exc,
+            )
+        store.rewrite(records)
+        return True
+    return False
+
+
+def judge_and_writeback(
+    *,
+    text: str,
+    category: str | None,
+    goals: str,
+    session_id: str,
+    sessions_dir: Path,
+    model: str = DEFAULT_JUDGE_MODEL,
+    fallback_models: tuple[str, ...] = (),
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """Judge a session and persist the verdict via SessionStore.
+
+    If ``fallback_models`` is provided, tries them in order when ``model`` fails.
+    """
+    if fallback_models:
+        verdict = judge_session_with_fallback(
+            text,
+            category=category,
+            goals=goals,
+            default_model=model,
+            fallback_models=fallback_models,
+            api_key=api_key,
+        )
+    else:
+        verdict = judge_session(
+            text,
+            category=category,
+            goals=goals,
+            model=model,
+            api_key=api_key,
+        )
+    if verdict is None:
+        return {"status": "failed"}
+
+    normalized = normalize_judge_verdict(verdict)
+    updated = write_alignment_grade(
+        session_id=session_id,
+        verdict=normalized,
+        sessions_dir=sessions_dir,
+    )
+    if not updated:
+        return {"status": "no_record", **normalized}
+
+    return {"status": "ok", **normalized}

@@ -1,7 +1,8 @@
-"""gptme-sessions — session tracking and analytics for gptme agents.
+"""gptme-sessions — session tracking and analytics for agents.
 
+Supports trajectories from gptme, Claude Code, Codex, and Copilot.
 Provides append-only JSONL-based session records with query, stats,
-and analytics capabilities. Designed for any gptme agent to track
+and analytics capabilities. Designed for any agent to track
 operational metadata across sessions.
 
 Usage:
@@ -20,6 +21,7 @@ from .discovery import (
     discover_gptme_sessions,
     parse_gptme_config,
     session_date_from_path,
+    session_datetime_from_path,
 )
 from .post_session import PostSessionResult, post_session
 from .record import MODEL_ALIASES, SessionRecord, normalize_model
@@ -45,6 +47,12 @@ from .classification import (
     classify_session,
     judge_and_classify,
     normalize_category,
+)
+from .spans import (
+    SpanAggregates,
+    ToolSpan,
+    extract_spans_from_cc_jsonl,
+    extract_spans_from_gptme_jsonl,
 )
 from .store import SessionStore
 from .thompson_sampling import Bandit, BanditArm, BanditState, load_bandit_means
@@ -86,6 +94,7 @@ __all__ = [
     "parse_gptme_config",
     "decode_cc_project_path",
     "session_date_from_path",
+    "session_datetime_from_path",
     "Bandit",
     "BanditArm",
     "BanditState",
@@ -96,4 +105,8 @@ __all__ = [
     "SessionTranscript",
     "TRANSCRIPT_SCHEMA_VERSION",
     "read_transcript",
+    "SpanAggregates",
+    "ToolSpan",
+    "extract_spans_from_cc_jsonl",
+    "extract_spans_from_gptme_jsonl",
 ]
