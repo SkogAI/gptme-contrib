@@ -2,17 +2,27 @@
 name = "gptme-contrib-workspace"
 version = "0.1.0"
 description = "Community contributions and utilities for gptme agents"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "gptmail",
-    "gptme-activity-summary",
-    "gptme-dashboard",
-    "gptme-forum",
-    "gptme-runloops",
-    "gptme-sessions",
-    "gptme-voice",
-    "gptme-whatsapp",
-    "gptodo",
+    "agent-client-protocol>=0.9.0",
+    "gptme-ace",
+    "gptme-attention-tracker",
+    "gptme-claude-code",
+    "gptme-consortium",
+    "gptme-gptodo",
+    "gptme-gupp",
+    "gptme-hooks-examples",
+    "gptme-imagen",
+    "gptme-lsp",
+    "gptme-rag",
+    "gptme-ralph",
+    "gptme-retrieval",
+    "gptme-tts",
+    "gptme-user-memories",
+    "gptme-warpgrep",
+    "gptme-wrapped",
+    "gptme-youtube",
+    "pip>=26.0.1",
 ]
 
 [dependency-groups]
@@ -30,19 +40,40 @@ members = ["packages/*", "plugins/*"]
 # packages/lessons -> gptme-lessons-extras
 # packages/lib -> gptme-contrib-lib
 # packages/run_loops -> gptme-runloops
-exclude = ["packages/__pycache__", "plugins/__pycache__", "packages/tasks", "packages/lessons", "packages/lib", "packages/run_loops"]
+exclude = [
+    "packages/__pycache__",
+    "plugins/__pycache__",
+    "packages/tasks",
+    "packages/lessons",
+    "packages/lib",
+    "packages/run_loops",
+]
 
 [tool.uv.sources]
-gptme = { git = "https://github.com/gptme/gptme.git", branch = "master" }
-gptme-forum = { workspace = true }
-gptme-voice = { workspace = true }
+gptme = { path = "/home/skogix/.local/src/gptme", editable = true }
 gptme-sessions = { workspace = true }
 gptme-activity-summary = { workspace = true }
 gptodo = { workspace = true }
 gptme-runloops = { workspace = true }
 gptme-whatsapp = { workspace = true }
 gptmail = { workspace = true }
-gptme-dashboard = { workspace = true }
+gptme-rag = { path = "/home/skogix/.local/src/gptme-rag", editable = true }
+gptme-retrieval = { workspace = true }
+gptme-user-memories = { workspace = true }
+gptme-warpgrep = { workspace = true }
+gptme-consortium = { workspace = true }
+gptme-youtube = { workspace = true }
+gptme-ace = { workspace = true }
+gptme-tts = { workspace = true }
+gptme-attention-tracker = { workspace = true }
+gptme-hooks-examples = { workspace = true }
+gptme-gptodo = { workspace = true }
+gptme-wrapped = { workspace = true }
+gptme-gupp = { workspace = true }
+gptme-imagen = { workspace = true }
+gptme-ralph = { workspace = true }
+gptme-claude-code = { workspace = true }
+gptme-lsp = { workspace = true }
 
 [tool.pytest.ini_options]
 # Required for cross-package test collection (pytest packages/)
@@ -53,9 +84,9 @@ asyncio_mode = "auto"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 ignore = [
-    "E501",    # line-too-long: 179 pre-existing violations, fix separately
-    "UP006",   # non-pep585-annotation: bulk-fix separately
-    "UP035",   # deprecated-import: bulk-fix separately
+    "E501",  # line-too-long: 179 pre-existing violations, fix separately
+    "UP006", # non-pep585-annotation: bulk-fix separately
+    "UP035", # deprecated-import: bulk-fix separately
 ]
 
 [tool.mypy]
@@ -63,7 +94,4 @@ check_untyped_defs = true
 # Exclude packages with hyphenated names from mypy
 # These cause "not a valid Python package name" errors due to mypy config parsing
 # TODO: investigate mypy hyphen handling (gptme-runloops fixed and type-checked)
-exclude = [
-    "^packages/gptme-contrib-lib",
-    "^packages/gptme-lessons-extras",
-]
+exclude = ["^packages/gptme-contrib-lib", "^packages/gptme-lessons-extras"]
