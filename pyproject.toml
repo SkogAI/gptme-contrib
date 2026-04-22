@@ -5,10 +5,14 @@ description = "Community contributions and utilities for gptme agents"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "agent-client-protocol>=0.9.0",
+    "gptmail",
     "gptme-ace",
+    "gptme-activity-summary",
     "gptme-attention-tracker",
     "gptme-claude-code",
     "gptme-consortium",
+    "gptme-dashboard",
+    "gptme-forum",
     "gptme-gptodo",
     "gptme-gupp",
     "gptme-hooks-examples",
@@ -17,11 +21,16 @@ dependencies = [
     "gptme-rag",
     "gptme-ralph",
     "gptme-retrieval",
+    "gptme-sessions",
     "gptme-tts",
     "gptme-user-memories",
+    "gptme-voice",
     "gptme-warpgrep",
+    "gptme-whatsapp",
     "gptme-wrapped",
     "gptme-youtube",
+    "gptme[acp,datascience,pyinstaller,server,sounds]",
+    "gptodo",
     "pip>=26.0.1",
 ]
 
@@ -50,13 +59,7 @@ exclude = [
 ]
 
 [tool.uv.sources]
-gptme = { path = "/home/skogix/.local/src/gptme", editable = true }
-gptme-sessions = { workspace = true }
-gptme-activity-summary = { workspace = true }
-gptodo = { workspace = true }
 gptme-runloops = { workspace = true }
-gptme-whatsapp = { workspace = true }
-gptmail = { workspace = true }
 gptme-rag = { path = "/home/skogix/.local/src/gptme-rag", editable = true }
 gptme-retrieval = { workspace = true }
 gptme-user-memories = { workspace = true }
@@ -74,6 +77,15 @@ gptme-imagen = { workspace = true }
 gptme-ralph = { workspace = true }
 gptme-claude-code = { workspace = true }
 gptme-lsp = { workspace = true }
+gptme-forum = { workspace = true }
+gptodo = { workspace = true }
+gptme-voice = { workspace = true }
+gptme-sessions = { workspace = true }
+gptme-activity-summary = { workspace = true }
+gptme-whatsapp = { workspace = true }
+gptme-dashboard = { workspace = true }
+gptmail = { workspace = true }
+gptme = { path = "../gptme", editable = true }
 
 [tool.pytest.ini_options]
 # Required for cross-package test collection (pytest packages/)
